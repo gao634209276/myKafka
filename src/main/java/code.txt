@@ -1,0 +1,135 @@
+Kafka消费者编程模型
+分区消费模型
+	1.如下模式:
+		Kafka Cluster{
+			Server1[Partition1,Partition2],Server2[Partition3,Partition4]
+		}
+		Client[Consumer1,Consumer2,Consumer3,Consumer4]
+	其中Consumer和Partition是一对一关系
+
+	2.分区消费伪代码描述
+
+		main()
+		   获取分区的size
+		   for index =0 to size
+			 create thread(or process) consumer(Index)
+
+		第index个线程(进程)
+		consumer(index)
+			创建到kafka broker的连接: KafkaClient(host,port)
+			指定消费参数构建consumer: SimpleConsumer(topic, partitions)
+			设置消费offset : consumer.seek(offset,0)
+			while  True
+			  消费指定topic第index个分区的数据
+			  处理
+			 记录当前消息offset
+			 提交当前offset（可选）
+
+组(Group)消费模型
+	Kafka Cluster{
+		Server1[P1,P2],Server2[P3,P4]
+	}
+	Consumer GroupA[C1,C2],Consumer GroupB[C3,C4,C5,C6]
+	所有Server的Partition在每个Consumer Group中均有Consumer与之对应,
+	在A组中每个Consumer消费两个不同的Partition,而B组每个Consumer只平分每个Partition
+
+	按组(Group)消费伪代码描述
+		main()
+		   设置需要创建的流数N
+		   for index =0 to N
+			 create thread  consumer(Index)
+
+		第index个线程
+		consumer(index)
+			创建到kafka broker的连接: KafkaClient(host,port)
+			指定消费参数构建consumer: SimpleConsumer(topic, partitions)
+			设置从头消费还是从最新的消费(smallest或largest)
+			while  True
+				从指定topic的第index个流取数据
+				处理
+			 （offset会自动提交到zookeeper,无需我们操作）
+	Consumer分配算法
+		For each topic T that Ci subscribes to
+		let PT be all partitions producing topic T
+		let CG be all consumers in the same group as Ci that consume topic T
+		sort PT (so partitions on the same broker are clustered together)
+		sort CG
+		let i be the index position of Ci in CG and let N = size(PT)/size(CG)
+		assign partitions from i*N to (i+1)*N - 1 to consumer Ci
+		remove current entries owned by Ci from the partition owner registry
+		add newly assigned partitions to the partition owner registry
+		   (we may need to re-try this until the original partition owner releases
+		   its ownership)
+两种消费模型对比
+	分区消费模型更加灵活但是：
+	（1）需要自己处理各种异常情况；
+	（2）需要自己管理offset(以实现消息传递的其他语义)；
+	组消费模型更加简单，但是不灵活：
+	（1）不需要自己处理异常情况，不需要自己管理offset；
+	（2）只能实现kafka默认的最少一次消息传递语义；
+
+-----------------------------------------------
+Kafka消费者的Python和Java客户端实现
+Python需要的软件环境:
+	已搭建好的kafka集群、Linux服务器一台、Python2.7.6 、kafka-Python软件包
+	分区消费模型的Python实现;
+	组(Group)消费模型的Python实现;
+Python客户端参数调优
+	fetch_size_bytes: 从服务器获取单包大小;
+	buffer_size: kafka客户端缓冲区大小;
+	Group:分组消费时分组名
+	auto_commit: offset是否自动提交;
+Java客户端参数调
+	fetchSize: 从服务器获取单包大小;
+	bufferSize: kafka客户端缓冲区大小;
+	group.id:  分组消费时分组名
+-----------------------------------------------
+Kafka生产者编程模型
+同步生产模型
+	开始-->发送-->收到发送成功确认?-->是:结束,否-->
+	-->短暂sleep-->重新发送-->是否达到最大次数-->否:继续sleep循环,是:结束
+异步生产模型
+	开始-->发送-->放入发送队列
+		-->1.是否累计指定消息数
+			-->N:是否累计到超时时间-->N:返回1循环,Y:发送给kafka broker
+			-->Y:发送给kafka broker
+		-->2.结束
+
+两种生产模型伪代码描述
+	main()
+	  创建到kafka broker的连接:KafkaClient(host,port)
+	  选择或者自定义生产者负载均衡算法 partitioner
+	  设置生产者参数
+	  根据负载均衡算法和设置的生产者参数构造Producer对象
+
+	  while True
+		getMessage：从上游获得一条消息
+		按照kafka要求的消息格式构造kafka消息
+		 根据分区算法得到分区
+		发送消息
+		处理异常
+
+两种生产模型对比
+	同步生产模型:
+	（1）低消息丢失率；
+	（2）高消息重复率(由于网络原因，回复确认未收到)；
+	（3）高延迟
+	异步生产模型:
+	（1）低延迟;
+	（2）高发送性能；
+	（3）高消息丢失率(无确认机制，发送端队列满)
+
+-----------------------------------------------
+Kafka生产者的Python和Java客户端实现
+Python客户端参数调优
+	req_acks:发送失败重试次数;
+	ack_timeout:  未接到确认，认为发送失败的时间;
+	async :  是否异步发送；
+	batch_send_every_n:  异步发送时，累计最大消息数；
+	batch_send_every_t:异步发送时，累计最大时间；
+Java客户端参数调优
+	message.send.max.retries: 发送失败重试次数;
+	retry.backoff.ms :未接到确认，认为发送失败的时间;
+	producer.type:  同步发送或者异步发送；
+	batch.num.messages: 异步发送时，累计最大消息数；
+	queue.buffering.max.ms:异步发送时，累计最大时间；

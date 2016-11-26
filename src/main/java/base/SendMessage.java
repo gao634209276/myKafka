@@ -1,4 +1,4 @@
-package send;
+package base;
 
 import java.util.Properties;
 import java.util.Random;
@@ -11,15 +11,14 @@ public class SendMessage {
 	public static void main(String[] args) {
 		// producer的配置
 		Properties props = new Properties();
-		props.setProperty("zookeeper.connect",
-				"hadoop:2181,hadoop1:2181,hadoop2:2181/kafka");
+		props.setProperty("zookeeper.connect", "hadoop:2181,hadoop1:2181,hadoop2:2181/kafka");
 		props.setProperty("serializer.class", "kafka.serializer.StringEncoder");
 		props.setProperty("producer.type", "async");
 		props.setProperty("compression.codec", "1");
 		props.setProperty("metadata.broker.list", "hadoop:9092");
 
-		props.put("key.serializer","org.apache.kafka.common.serialization.StringSerializer");
-		props.put("value.serializer","org.apache.kafka.common.serialization.StringSerializer");
+		props.put("key.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+		props.put("value.serializer", "org.apache.kafka.common.serialization.StringSerializer");
 		props.put("bootstrap.servers", "hadoop:9092");
 
 		KafkaProducer<String, String> producer = new KafkaProducer<>(props);

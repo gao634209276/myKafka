@@ -7,22 +7,22 @@
     <groupId>myKafka</groupId>
     <artifactId>myKafka</artifactId>
     <version>1.0-SNAPSHOT</version>
+    <properties>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <kafka.version>0.10.0.0</kafka.version>
+        <!--<kafka.version>0.8.1</kafka.version>-->
+    </properties>
     <dependencies>
 
         <dependency>
             <groupId>org.apache.kafka</groupId>
             <artifactId>kafka-clients</artifactId>
-            <version>0.10.0.0</version>
-        </dependency>
-        <dependency>
-            <groupId>org.apache.kafka</groupId>
-            <artifactId>kafka-clients</artifactId>
-            <version>0.10.0.0</version>
+            <version>${kafka.version}</version>
         </dependency>
         <dependency>
             <groupId>org.apache.kafka</groupId>
             <artifactId>kafka-streams</artifactId>
-            <version>0.10.0.0</version>
+            <version>${kafka.version}</version>
         </dependency>
     </dependencies>
 
