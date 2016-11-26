@@ -1,0 +1,45 @@
+http://kafka.apache.org/documentation.html#api
+http://kafka.apache.org/documentation#api
+
+Apache Kafka包含新的Java客户端，这些新的的客户端将取代现存的Scala客户端，但是为了兼容性，它们仍将存在一段时间。
+可以通过一些单独的jar包调用这些客户端，这些包的依赖性都比较小，同时老的Scala客户端仍会存在。
+
+
+一、Producer   API
+	Producer API允许应用发送数据流到kafka集群的topics中,参考:
+	http://kafka.apache.org/0100/javadoc/index.html?org/apache/kafka/clients/producer/KafkaProducer.html
+	我们鼓励所有新开发都使用新的java版本producer。
+	这个客户端是经过生产环境测试的，并且一般情况下会比先前的Scala客户端要更快而且具有更多的特性。
+	你可以通过添加对客户端jar包的依赖来调用这个客户端，如下所示，使用maven配置：
+		<dependency>
+			<groupId>org.apache.kafka</groupId>
+			<artifactId>kafka-clients</artifactId>
+			<version>0.10.0.0</version>
+		</dependency>
+
+	可以通过javadoc文件查看如何使用producer。
+
+二、Consumer API
+	在0.9.0发布版本中，增加了新的java版本的consumer，用来替代已有的high-level的基于zookeeper的consumer，以及low-level的consumer APIs。
+	ConsumerAPI允许应用从Kafka集群的topics中读取数据流
+	如何使用consumer可以从官方doc中查看:
+	http://kafka.apache.org/0100/javadoc/index.html?org/apache/kafka/streams/KafkaStreams.html
+
+		<dependency>
+			<groupId>org.apache.kafka</groupId>
+			<artifactId>kafka-clients</artifactId>
+			<version>0.10.0.0</version>
+		</dependency>
+
+三 Streams API
+	在0.10.0 release版本中，我们增加了新的客户端调用库Kafka Streams，用来支持流式处理应用。
+	Streams API允许将输入的topic的数据流transform到输出的topics
+	如何使用该lib的例子在javadoc中给出:
+	http://kafka.apache.org/0100/javadoc/index.html?org/apache/kafka/streams/KafkaStreams.html
+	http://kafka.apache.org/documentation.html#streams
+	maven依赖如下:
+		<dependency>
+		    <groupId>org.apache.kafka</groupId>
+		    <artifactId>kafka-streams</artifactId>
+		    <version>0.10.0.0</version>
+		</dependency>
