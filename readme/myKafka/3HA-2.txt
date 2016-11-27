@@ -345,10 +345,3 @@ State Change Log Merge Tool
 	bin/kafka-run-class.sh kafka.tools.StateChangeLogMerger
 	--logs /opt/kafka_2.11-0.8.2.1/logs/state-change.log
 	--topic topic1 --partitions 0,1,2,3,4,5,6,7
-
-
-
-
-
-
-

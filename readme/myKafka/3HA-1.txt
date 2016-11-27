@@ -386,17 +386,3 @@ HA相关Zookeeper结构
 	下篇文章将详细介绍Kafka HA相关的异常情况处理，
 	例如，怎样处理Broker failover，Follower如何从Leader fetch消息，如何重新分配Replica，如何处理Controller failure等。
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
