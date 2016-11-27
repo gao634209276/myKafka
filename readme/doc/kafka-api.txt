@@ -1,6 +1,6 @@
 http://kafka.apache.org/documentation.html#api
 http://kafka.apache.org/documentation#api
-
+http://blog.csdn.net/dslztx/article/details/50116709
 Apache Kafka包含新的Java客户端，这些新的的客户端将取代现存的Scala客户端，但是为了兼容性，它们仍将存在一段时间。
 可以通过一些单独的jar包调用这些客户端，这些包的依赖性都比较小，同时老的Scala客户端仍会存在。
 

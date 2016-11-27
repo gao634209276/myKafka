@@ -1,135 +1,71 @@
-Kafka消费者编程模型
-分区消费模型
-	1.如下模式:
-		Kafka Cluster{
-			Server1[Partition1,Partition2],Server2[Partition3,Partition4]
-		}
-		Client[Consumer1,Consumer2,Consumer3,Consumer4]
-	其中Consumer和Partition是一对一关系
+Kafka 0.9版本对Java client的api做出了较大调整，
+本文主要总结了Kafka 0.9在集群搭建、高可用性、新API方面的相关过程和细节，
+以及本人在安装调试过程中踩出的各种坑。
 
-	2.分区消费伪代码描述
+关于Kafka的结构、功能、特点、适用场景等，网上到处都是，我就不再赘述了，直接进入正文
+Kafka 0.9集群安装配置
+此处的坑：按照官方文档的说法，
+	advertised.host.name和advertised.port这两个参数用于定义集群向Producer和 Consumer广播的节点host和port，
+	如果不定义的话，会默认使用host.name和port的定义。
+	但在实际应用中，我发现如果不定义 advertised.host.name参数，使用Java客户端从远端连接集群时，会发生连接超时，
+	抛出异常：org.apache.kafka.common.errors.TimeoutException: Batch Expired
+	经过debug发现，连接到集群是成功的，但连接到集群后更新回来的集群meta信息却是错误的：
+	http://dl2.iteye.com/upload/attachment/0116/2134/643043e9-08d4-3402-9471-4c4adaaba323.png
+	能够看到，metadata中的Cluster信息，节点的hostname是iZ25wuzqk91Z这样的一串数字，而不是实际的ip地址10.0.0.100和101。
+	iZ25wuzqk91Z其实是远端主机的hostname，这说明在没有配置advertised.host.name 的情况下，
+	Kafka并没有像官方文档宣称的那样改为广播我们配置的host.name，而是广播了主机配置的hostname。
+	远端的客户端并没有配置 hosts，所以自然是连接不上这个hostname的。
+	要解决这一问题，把host.name和advertised.host.name都配置成绝对 的ip地址就可以了。
 
-		main()
-		   获取分区的size
-		   for index =0 to size
-			 create thread(or process) consumer(Index)
+接下来，我们在另一台主机也完成Kafka的安装和配置，然后在两台主机上分别启动Kafka：
+	bin/kafka-server-start.sh -daemon config/server.properties
+此处的坑：
+	官方给出的后台启动kafka的方法是：bin/kafka-server-start.sh config/server.properties &
+	但用这种方式启动后，只要断开Shell或登出，Kafka服务就会自动shutdown，
+	不知是OS的问题还是SSH的问题还是Kafka自己的问题，总之我改用-daemon方式启动Kafka才不会在断开shell后自动shutdown。
 
-		第index个线程(进程)
-		consumer(index)
-			创建到kafka broker的连接: KafkaClient(host,port)
-			指定消费参数构建consumer: SimpleConsumer(topic, partitions)
-			设置消费offset : consumer.seek(offset,0)
-			while  True
-			  消费指定topic第index个分区的数据
-			  处理
-			 记录当前消息offset
-			 提交当前offset（可选）
+接下来，我们创建一个名为test，拥有两个分区，两个副本的Topic：
+	bin/kafka-topics.sh --create --zookeeper 10.0.0.100:2181,10.0.0.101:2181,10.0.0.102:2181 --replication-factor 2 --partitions 2 --topic tes
 
-组(Group)消费模型
-	Kafka Cluster{
-		Server1[P1,P2],Server2[P3,P4]
-	}
-	Consumer GroupA[C1,C2],Consumer GroupB[C3,C4,C5,C6]
-	所有Server的Partition在每个Consumer Group中均有Consumer与之对应,
-	在A组中每个Consumer消费两个不同的Partition,而B组每个Consumer只平分每个Partition
+创建完成后，使用如下命令查看Topic状态：
+	bin/kafka-topics.sh --describe --zookeeper 10.0.0.100:2181,10.0.0.101:2181,10.0.0.102:2181 --topic test
+输出：
+Topic:test PartitionCount:2 ReplicationFactor:2 Configs:
+     Topic: test Partition: 0 Leader: 1 Replicas: 1,0 Isr: 0,1
+     Topic: test Partition: 1 Leader: 0 Replicas: 0,1 Isr: 0,1
+解读：test这个topic，当前有2个分区，分别为0和1，分区0的Leader是1（这个1是broker.id），分区0有两个 Replica（副本），
+	分别是1和0，这两个副本中，Isr（In-sync）的是0和1。
+	分区2的Leader是0，也有两个Replica，同样也 是两个replica都是in-sync状态
 
-	按组(Group)消费伪代码描述
-		main()
-		   设置需要创建的流数N
-		   for index =0 to N
-			 create thread  consumer(Index)
 
-		第index个线程
-		consumer(index)
-			创建到kafka broker的连接: KafkaClient(host,port)
-			指定消费参数构建consumer: SimpleConsumer(topic, partitions)
-			设置从头消费还是从最新的消费(smallest或largest)
-			while  True
-				从指定topic的第index个流取数据
-				处理
-			 （offset会自动提交到zookeeper,无需我们操作）
-	Consumer分配算法
-		For each topic T that Ci subscribes to
-		let PT be all partitions producing topic T
-		let CG be all consumers in the same group as Ci that consume topic T
-		sort PT (so partitions on the same broker are clustered together)
-		sort CG
-		let i be the index position of Ci in CG and let N = size(PT)/size(CG)
-		assign partitions from i*N to (i+1)*N - 1 to consumer Ci
-		remove current entries owned by Ci from the partition owner registry
-		add newly assigned partitions to the partition owner registry
-		   (we may need to re-try this until the original partition owner releases
-		   its ownership)
-两种消费模型对比
-	分区消费模型更加灵活但是：
-	（1）需要自己处理各种异常情况；
-	（2）需要自己管理offset(以实现消息传递的其他语义)；
-	组消费模型更加简单，但是不灵活：
-	（1）不需要自己处理异常情况，不需要自己管理offset；
-	（2）只能实现kafka默认的最少一次消息传递语义；
 
------------------------------------------------
-Kafka消费者的Python和Java客户端实现
-Python需要的软件环境:
-	已搭建好的kafka集群、Linux服务器一台、Python2.7.6 、kafka-Python软件包
-	分区消费模型的Python实现;
-	组(Group)消费模型的Python实现;
-Python客户端参数调优
-	fetch_size_bytes: 从服务器获取单包大小;
-	buffer_size: kafka客户端缓冲区大小;
-	Group:分组消费时分组名
-	auto_commit: offset是否自动提交;
-Java客户端参数调
-	fetchSize: 从服务器获取单包大小;
-	bufferSize: kafka客户端缓冲区大小;
-	group.id:  分组消费时分组名
------------------------------------------------
-Kafka生产者编程模型
-同步生产模型
-	开始-->发送-->收到发送成功确认?-->是:结束,否-->
-	-->短暂sleep-->重新发送-->是否达到最大次数-->否:继续sleep循环,是:结束
-异步生产模型
-	开始-->发送-->放入发送队列
-		-->1.是否累计指定消息数
-			-->N:是否累计到超时时间-->N:返回1循环,Y:发送给kafka broker
-			-->Y:发送给kafka broker
-		-->2.结束
 
-两种生产模型伪代码描述
-	main()
-	  创建到kafka broker的连接:KafkaClient(host,port)
-	  选择或者自定义生产者负载均衡算法 partitioner
-	  设置生产者参数
-	  根据负载均衡算法和设置的生产者参数构造Producer对象
 
-	  while True
-		getMessage：从上游获得一条消息
-		按照kafka要求的消息格式构造kafka消息
-		 根据分区算法得到分区
-		发送消息
-		处理异常
 
-两种生产模型对比
-	同步生产模型:
-	（1）低消息丢失率；
-	（2）高消息重复率(由于网络原因，回复确认未收到)；
-	（3）高延迟
-	异步生产模型:
-	（1）低延迟;
-	（2）高发送性能；
-	（3）高消息丢失率(无确认机制，发送端队列满)
 
------------------------------------------------
-Kafka生产者的Python和Java客户端实现
-Python客户端参数调优
-	req_acks:发送失败重试次数;
-	ack_timeout:  未接到确认，认为发送失败的时间;
-	async :  是否异步发送；
-	batch_send_every_n:  异步发送时，累计最大消息数；
-	batch_send_every_t:异步发送时，累计最大时间；
-Java客户端参数调优
-	message.send.max.retries: 发送失败重试次数;
-	retry.backoff.ms :未接到确认，认为发送失败的时间;
-	producer.type:  同步发送或者异步发送；
-	batch.num.messages: 异步发送时，累计最大消息数；
-	queue.buffering.max.ms:异步发送时，累计最大时间；
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
