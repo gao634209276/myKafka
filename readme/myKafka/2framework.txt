@@ -16,7 +16,6 @@ Terminology
 		每个Consumer属于一个特定的Consumer Group
 		（可为每个Consumer指定group name，若不指定group name则属于默认的group）。
 
-
 Kafka拓扑结构
 	http://www.jasongj.com/img/KafkaColumn1/KafkaArchitecture.png
 
