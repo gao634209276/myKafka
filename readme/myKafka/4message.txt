@@ -129,11 +129,12 @@ Kafka集群分区日志迁移
 -------------------------------------------------------------------
 Kafka集群监控
 Kafka Offset Monitor介绍
-在生产环境需要集群高可用，所以需要对Kafka集群进行监控。Kafka Offset Monitor可以监控Kafka集群以下几项：
-	Kafka集群当前存活的broker集合；
-	Kafka集群当前活动topic集合；
-	消费者组列表
-	Kafka集群当前consumer按组消费的offset lag数(即当前topic当前分区目前有多少消息积压而没有及时消费)
+在生产环境需要集群高可用，所以需要对Kafka集群进行监控。
+Kafka Offset Monitor可以监控Kafka集群以下几项：
+	1.Kafka集群当前存活的broker集合；
+	2.Kafka集群当前活动topic集合；
+	3.消费者组列表
+	4.Kafka集群当前consumer按组消费的offset lag数(即当前topic当前分区目前有多少消息积压而没有及时消费)
 
 Kafka Offset Monitor使用
 部署Kafka Offset Minotor：
@@ -144,33 +145,28 @@ Kafka Offset Monitor使用
 
 Kafka Manager介绍
 Kafka Manager由雅虎开源，提供以下功能：
-	管理几个不同的集群；
-	容易地检查集群的状态(topics, brokers, 副本的分布, 分区的分布) ；
-	选择副本
-	基于集群的当前状态产生分区分配
-	重新分配分区
+	1.管理几个不同的集群；
+	2.容易地检查集群的状态(topics, brokers, 副本的分布, 分区的分布) ；
+	3.选择副本
+	4.基于集群的当前状态产生分区分配
+	5.重新分配分区
 
-Kafka Manager使用
-Kafka Manager的安装，方法一(不但要求能上网，还要求能翻墙)：
-	安装sbt：
-	http://www.scala-sbt.org/download.html
-	下载后，解压并配置环境变量(将SBT_HOME/bin配置到PATH变量中)
-	安装Kafka Manager :
-	git clone https://github.com/yahoo/kafka-manager
-	cd kafka-manager
-	sbt clean dist
-部署Kafka Manager
-	修改conf/application.conf，把kafka-manager.zkhosts改为自己的zookeeper服务器地址
-	bin/kafka-manager -Dconfig.file=conf/application.conf -Dhttp.port=8007 &
-
-Kafka Manager的安装，方法二：
+Kafka Manager的安装，
+	方法一(不但要求能上网，还要求能翻墙)：
+		安装sbt：
+		http://www.scala-sbt.org/download.html
+		下载后，解压并配置环境变量(将SBT_HOME/bin配置到PATH变量中)
+		安装Kafka Manager :
+		git clone https://github.com/yahoo/kafka-manager
+		cd kafka-manager
+		sbt clean dist
+	方法二：
 	下载打包好的Kafka manager(也可以在课程源代码处下载)：
 	https://github.com/scootli/kafka-manager-1.0-SNAPSHOT/tree/master/kafka-manager-1.0-SNAPSHOT
-	下载后解压
-	修改conf/application.conf，把Kafka-manager.zkhosts改为自己的zookeeper服务器地址
-	bin/kafka-manager -Dconfig.file=conf/application.conf -Dhttp.port=8007 &
 
-
+	部署Kafka Manager
+		修改conf/application.conf，把kafka-manager.zkhosts改为自己的zookeeper服务器地址
+		bin/kafka-manager -Dconfig.file=conf/application.conf -Dhttp.port=8007 &
 
 
 

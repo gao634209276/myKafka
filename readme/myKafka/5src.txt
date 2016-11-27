@@ -1,0 +1,205 @@
+Kafka消费者源码介绍
+分区消费模式源码介绍
+	1.通过findLeader创建PartitionMetadata-->创建SimpleConsumer
+	-->2.构建FetchRequest-->发送FetchRequest-->如果有错误:返回1循环,成功
+	-->接受FetchResponse-->迭代处理消息-->从2循环
+
+	分区消费模式直接由客户端(任何高级语言编写)使用Kafka提供的协议向服务器发送RPC请求获取数据，
+	服务器接受到客户端的RPC请求后，将数据构造成RPC响应，返回给客户端，客户端解析相应的RPC响应获取数据。
+		1.Kafka支持的协议众多，使用比较重要的有：
+		2.获取消息的FetchRequest和FetchResponse
+		3.获取offset的OffsetRequest和OffsetResponse
+		4.提交offset的OffsetCommitRequest和OffsetCommitResponse
+		5.获取Metadata的Metadata Request和Metadata Response
+		6.生产消息的ProducerRequest和ProducerResponse
+
+
+组消费模式源码介绍
+	通过配置创建ConsumerConfig-->创建ConsumerConnector-->创建KafkaStream-->创建ConsumerIterator
+	-->1.是否有消息next()-->有:处理消息,并循环1,无消息-->阻塞,一直到有消息进行处理
+
+	通过配置创建ConsumerConfig-->创建ZookeeperConsumerConnector
+	-->1.创建ConsumerFetcherManager-->创建ConsumerFetcheThead-->
+		发送FetchRequest获取消息-->获取FetchResponse填充数据到KafkaStream
+	-->2.创建Scheduler-->autoCommit Offset
+
+两种消费模式服务器端源码对比
+	分区消费模式具有以下特点：
+		1.指定消费topic、partition和offset通过向服务器发送RPC请求进行消费;
+		2.需要自己提交offset；
+		3.需要自己处理各种错误，如:leader切换错误
+		4.需要自己处理消费者负载均衡策略
+	组消费模式具有以下特点：
+		1.最终也是通过向服务器发送RPC请求完成的(和分区消费模式一样);
+		2.组消费模式由Kafka服务器端处理各种错误，
+		然后将消息放入队列再封装为迭代器(队列为FetchedDataChunk对象)，
+		客户端只需在迭代器上迭代取出消息；
+		3.由Kafka服务器端周期性的通过scheduler提交当前消费的offset，无需客户端负责
+		4.Kafka服务器端处理消费者负载均衡
+		5.监控工具Kafka Offset Monitor 和Kafka Manager 均是基于组消费模式；
+	所以，尽可能使用组消费模式，除非你需要：
+		自己管理offset(比如为了实现消息投递的其他语义);
+		自己处理各种错误(根据自己业务的需求)；
+
+
+Kafka生产者源码介绍
+同步发送模式源码介绍
+	创建Producer-->创建发送者线程-->根据brokerId或Partition选择SyncPool
+	-->构造ProducerRequest请求-->按照用户执行的序列化函数序列化消息
+	-->1.发送ProducerRequest请求-->是否出错:
+		a.出错-->a.1出错没超过最大次数-->重新进入1循环
+			-->a.2出错超过最大次数-->发送出错
+		b.没有出错-->接受ProducerRequest-->按client配置发送ack信息
+
+异步发送模式源码介绍
+	producer-->异步发送消息到Blocking Queue-->send Thread循环轮询读取消息
+	-->1.partition查找对应SyncProducer: Producer Pool
+	-->2.批量发送数据<-->Kafka cluster
+
+	创建Producer-->创建发送者县城-->消息放入队列-->消息数是否达到?时间达到?
+	-->如果没有则继续循环放入消息队列,如果达到-->根据brokerId和Partition选择SyncPool
+	-->按照用户执行的序列化函数序列化消息
+	-->构造ProducerRequest请求-->发送ProducerRequest请求
+	-->接受ProducerResponse响应-->发送成功
+
+两种生产模式服务器端源码对比
+	同步发送模式具有以下特点：
+		1.同步的向服务器发送RPC请求进行生产;
+		2.发送错误可以重试；
+		3.可以向客户端发送ack;
+	异步发送模式具有以下特点：
+		1.最终也是通过向服务器发送RPC请求完成的(和同步发送模式一样);
+		2.异步发送模式先将一定量消息放入队列中，待达到一定数量后再一起发送；
+		3.异步发送模式不支持发送ack，但是Client可以调用回调函数获取发送结果；
+	所以，性能比较高的场景使用异步发送，准确性要求高的场景使用同步发送
+
+
+Kafka Server Reactor设计模型
+认识Java NIO
+Java NIO由以下几个核心部分组成 :
+	Channels;
+		Channel(通道)和java中的stream一样，用于传输数据的数据流，
+		数据可以从Channel读到Buffer中，也可以从Buffer 写到Channel中。
+	Buffers；
+	Selectors
+		Selector允许单线程处理多个 Channel。
+		使用Selector，首先得向Selector注册Channel，然后调用它的select()方法。
+		此方法会一直阻塞到某个注册的Channel有事件就绪。
+		一旦这个方法返回，线程就可以处理这些事件，事件的例子如新连接进来，数据接收等。
+        下图为一个单线程中使用一个Selector处理3个Channel：
+			Thread-->Selector-->Channel1,Channel2,Channel3
+
+认识Linux epoll模型
+	epoll 是一种IO多路复用技术 ，在linux内核中广泛使用。
+	常见的三种IO多路复用技术为select模型、poll模型和epoll模型。
+		1.select 模型需要轮询所有的套接字查看是否有事件发生.缺点:
+			(1)套接字最大支持1024个；
+			(2)主动轮询效率很低；
+			(3) 事件发生后需要将套接字从内核空间拷贝到用户空间，效率低
+		2.poll模型和select模型原理一样，但是修正了select模型最大套接字限制的缺点；
+		3.epoll模型修改主动轮询为被动通知，当有事件发生时，被动接收通知。
+		所以epoll模型注册套接字后，主程序可以做其他事情，当事件发生时，接收到通知后再去处理。
+		修正了select模型的三个缺点(第三点使用共享内存修正)。
+	Java NIO的Selector模型底层使用的就是epoll IO多路复用模型
+
+Kafka Server Reactor模型
+	Kafka SocketServer是基于Java NIO开发的，
+	采用了Reactor的模式(已被大量实践证明非常高效，在Netty和Mina中广泛使用)。
+	Kafka Reactor的模式包含三种角色：
+		Acceptor;
+		Processor；
+		Handler；
+	Kafka Reacator包含了1个Acceptor负责接受客户端请求，N个Processor线程负责读写数据
+	(为每个Connection创建出一个Processor去单独处理,每个Processor中均引用独立的Selector)，
+	M个Handler来处理业务逻辑。
+	在Acceptor和Processor，Processor和Handler之间都有队列来缓冲请求。
+
+		Client1,Client2-->SocketServer--(1..1)-->Acceptor
+		-->Array[processors]-->Processors[current]
+		-->Processor-->Selector
+
+	1.Acceptor的主要职责是监听客户端的连接请求，并建立和客户端的数据传输通道，
+	然后为这个客户端指定一个Processor，它的工作就到此结束，这样它就可以去响应下一个客户端的连接请求了;
+	2.Processor的主要职责是负责从客户端读取数据和将响应返回给客户端，它本身不处理具体的业务逻辑，
+	每个Processor都有一个Selector，用来监听多个客户端，因此可以非阻塞地处理多个客户端的读写请求，
+	Processor将数据放入RequestChannel的RequestQueue中和从ResponseQueue读取响应 ；
+	3.Handler(kafka.server.KafkaRequestHandler,kafka.server.KafkaApis)的职责是
+	从RequestChannel中的RequestQueue取出Request，
+	处理以后再将Response添加到RequestChannel中的ResponseQueue中；
+
+
+Kafka Partition Leader选举机制
+大数据常用的选主机制:
+Leader选举算法非常多，大数据领域常用的有 以下两种:
+	Zab(zookeeper使用);
+	Raft；
+	它们都是Paxos算法的变种。
+
+	Zab协议有四个阶段:
+		1.Leader election;
+		2.Discovery（或者epoch establish）；
+		3.Synchronization（或者sync with followers）
+		4.Broadcast
+		比如3个节点选举leader，编号为1,2,3。
+		1先启动，选择自己为leader，然后2启动首先也选择自己为 leader，
+		由于1,2都没过半，选择编号大的为leader，所以1,2都选择2为leader,
+		然后3启动发现1,2已经协商好且数量过半，于是3也选择2为leader，leader选举结束。
+
+	在Raft中，任何时候一个服务器可以扮演下面角色之一
+		1.Leader: 处理所有客户端交互，日志复制等，一般只有一个Leader；
+		2.Follower: 类似选民，完全被动
+		3.Candidate候选人: 可以被选为一个新的领导人
+		启动时在集群中指定一些机器为Candidate ，然后Candidate开始向其他机器(尤其是Follower)拉票，
+		当某一个Candidate的票数超过半数，它就成为leader。
+
+常用选主机制的缺点
+	由于Kafka集群依赖zookeeper集群，所以最简单最直观的方案是，
+	所有Follower都在ZooKeeper上设置一个Watch，一旦Leader宕机，其对应的ephemeral znode会自动删除，
+	此时所有Follower都尝试创建该节点，而创建成功者（ZooKeeper保证只有一个能创建成功）即是新的Leader，
+	其它Replica即为Follower。
+
+	前面的方案有以下缺点：
+	split-brain (脑裂):
+		这是由ZooKeeper的特性引起的，虽然ZooKeeper能保证所有Watch按顺序触发，
+		但并不能保证同一时刻所有Replica“看”到的状态是一样的，这就可能造成不同Replica的响应不一致 ;
+	herd effect (羊群效应):
+		如果宕机的那个Broker上的Partition比较多，会造成多个Watch被触发，造成集群内大量的调整；
+	ZooKeeper负载过重 :
+		每个Replica都要为此在ZooKeeper上注册一个Watch，当集群规模增加到几千个Partition时ZooKeeper负载会过重
+
+Kafka Partition选主机制
+	Kafka 的Leader Election方案解决了上述问题，
+	它在所有broker中选出一个controller，所有Partition的Leader选举都由controller决定。
+	controller会将Leader的改变直接通过RPC的方式（比ZooKeeper Queue的方式更高效）通知需为此作为响应的Broker。
+
+	Kafka 集群controller的选举过程如下 ：
+	每个Broker都会在Controller Path (/controller)上注册一个Watch。
+	当前Controller失败时，对应的Controller Path会自动消失（因为它是ephemeral Node），
+	此时该Watch被fire，所有“活”着的Broker都会去竞选成为新的Controller（创建新的Controller Path),
+	但是只会有一个竞选成功（这点由Zookeeper保证）。
+	竞选成功者即为新的Leader，竞选失败者则重新在新的Controller Path上注册Watch。
+	因为Zookeeper的Watch是一次性的，被fire一次之后即失效，所以需要重新注册。
+
+	Kafka  partition  leader的选举过程如下 (由controller执行)：
+	从Zookeeper中读取当前分区的所有ISR(in-sync replicas)集合
+	调用配置的分区选择算法选择分区的leader
+
+
+	分区选择算法:
+		NoOpLeaderSelector,
+		OfflinePartitionLeader,
+		ReassignedPartitionLeader
+		PreferredReplicaPartitionLeader,
+		ControlledShutdownLeader
+	上面五种分区算法都是选择PreferredReplica作为当前Partition的leader。
+	区别仅仅是选择leader之后的操作有所不同。
+
+	所以，对于下图partition 0先选择broker 2，之后选择broker 0作为leader；
+	对于partition 1 先选择broker 0,之后选择broker 1作为leader；
+	partition 2先选择broker 1,之后选择broker 2作为leader。
+
+
+
+
+
+

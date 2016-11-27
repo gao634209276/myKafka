@@ -1,1 +1,1 @@
-{"version":1,"partitions":[]}
+{"version":1,"partitions":[{"topic":"test","partition":1,"replicas":[1,2]},{"topic":"test","partition":2,"replicas":[2,1]},{"topic":"test","partition":0,"replicas":[2,1]}]}
