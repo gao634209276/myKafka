@@ -1,4 +1,4 @@
 # Created by .ignore support plugin (hsz.mobi)
-将删除 .gitignore
 .idea/
 target/
+将删除 src/test/

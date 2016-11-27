@@ -103,15 +103,15 @@ Kafka集群leader平衡机制
 
 Kafka集群分区日志迁移
 	迁移topic数据到其他broker，请遵循下面四步：
-	写json文件,文件格式如下：
+	1.写json文件,文件格式如下：
 		cat topics-to-move.json
 		{"topics": [{"topic": "foo1"},{"topic": "foo2"}],
 		 "version":1
 		}
-	使用–generate生成迁移计划（下面的操作是将topic: foo1和foo2移动到broker 5,6）:
+	2.使用-generate生成迁移计划（下面的操作是将topic: foo1和foo2移动到broker 5,6）:
 	bin/kafka-reassign-partitions.sh --zookeeper localhost:2181 --topics-to-move-json-file topics-to-move.json --broker-list "5,6" –generate
 	这一步只是生成计划，并没有执行数据迁移；
-	使用–execute执行计划：
+	3.使用–execute执行计划：
 	bin/kafka-reassign-partitions.sh --zookeeper localhost:2181 --reassignment-json-file expand-cluster-reassignment.json –execute
 	执行前最好保存当前的分配情况，以防出错回滚
 
