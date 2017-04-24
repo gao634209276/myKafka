@@ -1,3 +1,8 @@
-{"topics": [{"topic": "test"}],
-"version":1
+{
+  "topics": [
+	{
+	  "topic": "test"
+	}
+  ],
+  "version": 1
 }
