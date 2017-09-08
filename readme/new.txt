@@ -1,0 +1,44 @@
+jmx监控
+http://www.cnblogs.com/dongguacai/p/5900507.html
+http://blog.csdn.net/u013256816/article/category/6500871
+
+kafka
+http://blog.csdn.net/u013256816/article/details/71091774
+
+
+kafka性能参数和压力测试揭秘
+http://blog.csdn.net/stark_summer/article/details/50203133
+
+kafka offset-check
+http://blog.csdn.net/m0_37739193/article/details/73849523
+kafka offset-check工具失效的问题
+http://www.cnblogs.com/dongxiao-yang/p/5414077.html
+
+http://blog.csdn.net/bobo82529/article/details/75005490
+kafka 监控
+https://www.iteblog.com/archives/1605.html
+
+
+kafka 高吞吐量性能揭秘
+http://blog.csdn.net/stark_summer/article/details/50144591
+
+	/proc/sys/vm/dirty_background_ratio:
+		这个参数指定了当文件系统缓存脏页数量达到系统内存百分之多少时（如5%）
+		就会触发pdflush/flush/kdmflush等后台回写进程运行，将一定缓存的脏页异步地刷入外存；
+	/proc/sys/vm/dirty_ratio
+		而这个参数则指定了当文件系统缓存脏页数量达到系统内存百分之多少时（如10%），
+		系统不得不开始处理缓存脏页（因为此时脏页数量已经比较多，为了避免数据丢失需要将一定脏页刷入外存）；
+		在此过程中很多应用进程可能会因为系统转而处理文件IO而阻塞。
+	Kafka官方并不建议通过Broker端的log.flush.interval.messages和log.flush.interval.ms来强制写盘
+	Kafka读写调优:
+		a. 脏页率超过第一个指标会启动pdflush开始Flush Dirty PageCache。
+		b. 脏页率超过第二个指标会阻塞所有的写操作来进行Flush。
+		c. 根据不同的业务需求可以适当的降低dirty_background_ratio和提高dirty_ratio。
+
+
+
+
+
+
+
+
