@@ -1,0 +1,37 @@
+[2017-09-12 15:42:40,696] INFO Partition [__consumer_offsets,42] on broker 1: Expanding ISR for partition [__consumer_offsets,42] from 1 to 1,2 (kafka.cluster.Partition)
+[2017-09-12 15:42:40,702] INFO Partition [__consumer_offsets,14] on broker 1: Expanding ISR for partition [__consumer_offsets,14] from 1 to 1,2 (kafka.cluster.Partition)
+[2017-09-12 15:42:40,712] INFO Partition [zhfw_Click_sms,11] on broker 1: Expanding ISR for partition [zhfw_Click_sms,11] from 1 to 1,2 (kafka.cluster.Partition)
+[2017-09-12 15:42:40,723] INFO Partition [__consumer_offsets,25] on broker 1: Expanding ISR for partition [__consumer_offsets,25] from 1 to 1,2 (kafka.cluster.Partition)
+[2017-09-12 15:42:40,729] INFO Partition [zhfw_Recommend,3] on broker 1: Expanding ISR for partition [zhfw_Recommend,3] from 1 to 1,2 (kafka.cluster.Partition)
+[2017-09-12 15:42:40,739] INFO Partition [__consumer_offsets,18] on broker 1: Expanding ISR for partition [__consumer_offsets,18] from 1 to 1,2 (kafka.cluster.Partition)
+[2017-09-12 15:42:40,744] INFO Partition [zhfw_Recommend,18] on broker 1: Expanding ISR for partition [zhfw_Recommend,18] from 1 to 1,2 (kafka.cluster.Partition)
+[2017-09-12 15:42:40,764] INFO Partition [messagemob,30] on broker 1: Expanding ISR for partition [messagemob,30] from 1 to 1,2 (kafka.cluster.Partition)
+[2017-09-12 15:42:40,771] INFO Partition [__consumer_offsets,1] on broker 1: Expanding ISR for partition [__consumer_offsets,1] from 1 to 1,2 (kafka.cluster.Partition)
+[2017-09-12 15:42:40,783] INFO Partition [messagemob,54] on broker 1: Expanding ISR for partition [messagemob,54] from 1 to 1,2 (kafka.cluster.Partition)
+[2017-09-12 15:42:40,788] INFO Partition [messagemob,16] on broker 1: Expanding ISR for partition [messagemob,16] from 1 to 1,2 (kafka.cluster.Partition)
+[2017-09-12 15:43:50,743] ERROR Processor got uncaught exception. (kafka.network.Processor)
+java.lang.OutOfMemoryError: Java heap space
+[2017-09-12 15:43:50,744] WARN Unexpected error from /132.46.115.24; closing connection (org.apache.kafka.common.network.Selector)
+java.lang.NullPointerException
+[2017-09-12 15:44:05,638] ERROR Processor got uncaught exception. (kafka.network.Processor)
+java.lang.OutOfMemoryError: Java heap space
+[2017-09-12 15:44:05,639] WARN Unexpected error from /132.46.115.81; closing connection (org.apache.kafka.common.network.Selector)
+java.lang.NullPointerException
+[2017-09-12 15:44:35,100] ERROR [KafkaApi-1] Error when handling request Name: FetchRequest; Version: 0; CorrelationId: 0; ClientId: flume-ConsumerFetcherThread-flume_kafka1-1505195897316-28b1e74c-0-1; ReplicaId: -1; MaxWait: 100 ms; MinBytes: 1 bytes; RequestInfo: [oldmobintfTopic,6] -> PartitionFetchInfo(18495174,1073741824),[oldmobintfTopic,19] -> PartitionFetchInfo(18269177,1073741824),[oldmobintfTopic,18] -> PartitionFetchInfo(18861596,1073741824),[oldmobintfTopic,14] -> PartitionFetchInfo(18782583,1073741824),[oldmobintfTopic,8] -> PartitionFetchInfo(18174255,1073741824),[oldmobintfTopic,5] -> PartitionFetchInfo(18425036,1073741824),[oldmobintfTopic,2] -> PartitionFetchInfo(18639088,1073741824),[oldmobintfTopic,1] -> PartitionFetchInfo(18216100,1073741824),[oldmobintfTopic,3] -> PartitionFetchInfo(18498315,1073741824),[oldmobintfTopic,13] -> PartitionFetchInfo(18085366,1073741824),[oldmobintfTopic,10] -> PartitionFetchInfo(18307319,1073741824),[oldmobintfTopic,17] -> PartitionFetchInfo(18350404,1073741824) (kafka.server.KafkaApis)
+java.lang.OutOfMemoryError: Java heap space
+[2017-09-12 15:44:35,100] INFO Client session timed out, have not heard from server in 29462ms for sessionid 0x25e74e7bae9003a, closing socket connection and attempting reconnect (org.apache.zookeeper.ClientCnxn)
+[2017-09-12 15:44:35,201] INFO zookeeper state changed (Disconnected) (org.I0Itec.zkclient.ZkClient)
+[2017-09-12 15:44:35,694] INFO Opening socket connection to server 132.46.115.98/132.46.115.98:2181. Will not attempt to authenticate using SASL (unknown error) (org.apache.zookeeper.ClientCnxn)
+[2017-09-12 15:44:35,695] INFO Socket connection established to 132.46.115.98/132.46.115.98:2181, initiating session (org.apache.zookeeper.ClientCnxn)
+[2017-09-12 15:44:35,696] INFO Session establishment complete on server 132.46.115.98/132.46.115.98:2181, sessionid = 0x25e74e7bae9003a, negotiated timeout = 30000 (org.apache.zookeeper.ClientCnxn)
+[2017-09-12 15:44:35,696] INFO zookeeper state changed (SyncConnected) (org.I0Itec.zkclient.ZkClient)
+[2017-09-12 15:45:06,422] ERROR Processor got uncaught exception. (kafka.network.Processor)
+java.lang.OutOfMemoryError: Java heap space
+[2017-09-12 15:45:06,424] WARN Unexpected error from /132.46.115.69; closing connection (org.apache.kafka.common.network.Selector)
+java.lang.NullPointerException
+[2017-09-12 15:45:21,688] ERROR Processor got uncaught exception. (kafka.network.Processor)
+java.lang.OutOfMemoryError: Java heap space
+[2017-09-12 15:45:21,689] WARN Unexpected error from /132.46.115.32; closing connection (org.apache.kafka.common.network.Selector)
+java.lang.NullPointerException
+[2017-09-12 15:45:50,896] ERROR Processor got uncaught exception. (kafka.network.Processor)
+java.lang.OutOfMemoryError: Java heap space

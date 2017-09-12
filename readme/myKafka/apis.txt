@@ -1,0 +1,1830 @@
+KafkaApis
+
+说明:用于处理对kafka的消息请求的中心转发组件,kafkaapis需要依赖于如下几个组件:
+
+apis = new KafkaApis(socketServer.requestChannel, replicaManager,
+  consumerCoordinator,
+  kafkaController, zkUtils, config.brokerId, config, metadataCache, metrics,
+  authorizer)
+其最核心的处理主要由KafkaApis中的handle函数进行调度.
+
+
+请求处理池
+
+在KafkaApis实例生成后,会同时生成一个KafkaRequestHandlerPool实例.
+
+这个实例主要用于对kafka的请求进行处理的实例,需要依赖如下几个组件与配置:
+
+配置项num.io.threads,默认值8,用于处理IO操作的线程个数.
+
+requestHandlerPool = new KafkaRequestHandlerPool(config.brokerId,
+
+  socketServer.requestChannel, apis, config.numIoThreads)
+
+
+
+这里会根据io的线程个数,生成对应的处理线程KafkaRequestHandler.
+
+this.logIdent = "[Kafka Request Handler on Broker " + brokerId + "], "
+val threads = new Array[Thread](numThreads)
+val runnables = new Array[KafkaRequestHandler](numThreads)
+for(i <- 0 until numThreads) {
+  runnables(i) = new KafkaRequestHandler(i, brokerId, aggregateIdleMeter, numThreads, requestChannel, apis)
+  threads(i) = Utils.daemonThread("kafka-request-handler-" + i, runnables(i))
+  threads(i).start()
+}
+
+
+
+接下来看看KafkaRequestHandler线程:
+
+def run() {
+  while(true) {
+    try {
+
+这里从请求队列中,取出一个请求,直接交给KafkaApis进行处理.
+      var req : RequestChannel.Request = null
+      while (req == null) {
+        // We use a single meter for aggregate idle percentage for the thread pool.
+        // Since meter is calculated as total_recorded_value / time_window and
+        // time_window is independent of the number of threads, each recorded idle
+        // time should be discounted by # threads.
+        val startSelectTime = SystemTime.nanoseconds
+        req = requestChannel.receiveRequest(300)
+        val idleTime = SystemTime.nanoseconds - startSelectTime
+        aggregateIdleMeter.mark(idleTime / totalHandlerThreads)
+      }
+
+      if(req eq RequestChannel.AllDone) {
+        debug("Kafka request handler %d on broker %d received shut down
+
+          command".format(
+          id, brokerId))
+        return
+      }
+      req.requestDequeueTimeMs = SystemTime.milliseconds
+      trace("Kafka request handler %d on broker %d handling request %s".format(id,
+
+           brokerId, req))
+      apis.handle(req)
+    } catch {
+      case e: Throwable => error("Exception when handling request", e)
+    }
+  }
+}
+
+
+对网络请求进行处理
+
+这个部分通过KafkaApis中的handle函数进行处理,并根据不同的请求路由进行不同的处理.
+处理metadata更新请求
+
+当某个partition发生变化后,会通过生成UpdateMetadataRequest请求向所有的brokers发送这个请求,也就是说每一个活着的broker都会接受到metadata变化的请求,并对请求进行处理.
+
+这个处理在partition的状态发生变化,partition重新分配,broker的启动与停止时,会发起update metadata的请求.
+
+入口通过KafkaApis中的handle函数
+
+case RequestKeys.UpdateMetadataKey => handleUpdateMetadataRequest(request)
+
+
+
+接下来看看handleUpdateMetadataRequest的函数处理流程:
+
+
+def handleUpdateMetadataRequest(request: RequestChannel.Request) {
+  val updateMetadataRequest =
+
+        request.requestObj.asInstanceOf[UpdateMetadataRequest]
+
+首先检查当前的用户是否有ClusterAction操作的权限，如果有接着执行下面的流程。
+  authorizeClusterAction(request)
+
+根据请求的metadata的更新消息，更新对memtadataCache中的内容。这个包含有broker的添加与删除，partition的状态更新等。
+  replicaManager.maybeUpdateMetadataCache(updateMetadataRequest, metadataCache)
+
+  val updateMetadataResponse = new UpdateMetadataResponse(
+
+              updateMetadataRequest.correlationId)
+
+
+  requestChannel.sendResponse(new Response(request,
+
+     new RequestOrResponseSend(request.connectionId, updateMetadataResponse)))
+}
+
+
+
+看看ReplicaManager中处理对更新metadata的请求的流程：
+
+在副本管理组件中，直接通过MetadataCache中的updateCache函数对请求过来的消息进行处理，用于更新当前的broker中的cache信息。
+
+更新cache的流程：
+
+1,更新cache中用于存储所有的broker节点的aliveBrokers集合。
+
+2,对请求过来的修改过状态的partition的集合进行迭代，
+
+2,1,如果partition的leader的节点被标记为-2,表示这是一个被删除的partition,从cache集合中找到这个partition对应的topic的子集合，并从这个集合中移出这个partition,如果这个topic中已经不在包含partition时，从cache中直接移出掉这个topic.
+
+2,2,这种情况下，表示是对partition的状态的修改，包含partition的副本信息，与partition的leader的isr的信息，直接更新cache集合中topic子集合中对应此partition的状态信息。
+
+
+def maybeUpdateMetadataCache(updateMetadataRequest: UpdateMetadataRequest,
+
+          metadataCache: MetadataCache) {
+  replicaStateChangeLock synchronized {
+    if(updateMetadataRequest.controllerEpoch < controllerEpoch) {
+      val stateControllerEpochErrorMessage = ("Broker %d received update metadata
+
+        request with correlation id %d from an " +
+        "old controller %d with epoch %d. Latest known controller epoch is %d")
+
+        .format(localBrokerId,
+        updateMetadataRequest.correlationId, updateMetadataRequest.controllerId,
+
+        updateMetadataRequest.controllerEpoch,
+        controllerEpoch)
+      stateChangeLogger.warn(stateControllerEpochErrorMessage)
+      throw new ControllerMovedException(stateControllerEpochErrorMessage)
+    } else {
+      metadataCache.updateCache(updateMetadataRequest, localBrokerId,
+
+          stateChangeLogger)
+      controllerEpoch = updateMetadataRequest.controllerEpoch
+    }
+  }
+}
+处理partition的LeaderAndIsr请求
+
+这个请求主要是针对partition的leader或者isr发生变化后的请求处理.这个接收请求的broker节点一定会是包含有对应的partition的副本的节点才会被接收到数据.
+
+case RequestKeys.LeaderAndIsrKey => handleLeaderAndIsrRequest(request)
+
+
+
+接下来看看handleLeaderAndIsrRequest的处理流程:
+
+def handleLeaderAndIsrRequest(request: RequestChannel.Request) {
+
+首先先得到请求的内容.针对一个LeaderAndIsr的请求,得到的请求内容是一个LeaderAndIsrRequest的实例.
+  val leaderAndIsrRequest = request.requestObj.asInstanceOf[LeaderAndIsrRequest]
+
+检查当前的请求用户是否具备ClusterAction操作的权限.
+  authorizeClusterAction(request)
+
+  try {
+
+这个函数用于在partition的isr被改变后,对成为leader的副本与成为follower的副本判断这个副本对应的topic是否是内置的__consumer_offsets topic,通过GroupMetadataManager中的对应函数来处理内置的topic的leader上线与下线的操作.
+    def onLeadershipChange(updatedLeaders: Iterable[Partition],
+
+            updatedFollowers: Iterable[Partition]) {
+      updatedLeaders.foreach { partition =>
+        if (partition.topic == GroupCoordinator.GroupMetadataTopicName)
+          coordinator.handleGroupImmigration(partition.partitionId)
+      }
+      updatedFollowers.foreach { partition =>
+        if (partition.topic == GroupCoordinator.GroupMetadataTopicName)
+          coordinator.handleGroupEmigration(partition.partitionId)
+      }
+    }
+
+根据请求的partition,通过副本管理组件来对partition进行leader或者follower的选择.
+    // call replica manager to handle updating partitions to become leader or follower
+    val result = replicaManager.becomeLeaderOrFollower(leaderAndIsrRequest,
+
+           metadataCache, onLeadershipChange)
+    val leaderAndIsrResponse = new LeaderAndIsrResponse(
+
+           leaderAndIsrRequest.correlationId,
+
+           result.responseMap, result.errorCode)
+
+
+
+生成操作成功后的返回结果,并向请求方进行响应.
+    requestChannel.sendResponse(new Response(request,
+
+           new RequestOrResponseSend(request.connectionId, leaderAndIsrResponse)))
+
+
+  } catch {
+    case e: KafkaStorageException =>
+      fatal("Disk error during leadership change.", e)
+      Runtime.getRuntime.halt(1)
+  }
+}
+
+
+
+在ReplicaManager中的becomeLeaderOrFollower函数:
+
+这个函数用于判断指定的partition是应该成为leader还是应该成为follower.
+def becomeLeaderOrFollower(leaderAndISRRequest: LeaderAndIsrRequest,
+                           metadataCache: MetadataCache,
+                           onLeadershipChange: (Iterable[Partition],
+
+                   Iterable[Partition]) => Unit): BecomeLeaderOrFollowerResult = {
+
+
+  leaderAndISRRequest.partitionStateInfos.foreach { case (
+
+(topic, partition), stateInfo) =>
+      stateChangeLogger.trace("日志)
+  }
+
+
+  replicaStateChangeLock synchronized {
+    val responseMap = new mutable.HashMap[(String, Int), Short]
+
+
+
+如果当前请求的epoch的值小于当前controllerEpoch的值,打印warn的日志,
+
+并返回StaleControllerEpochCode错误代码.
+    if (leaderAndISRRequest.controllerEpoch < controllerEpoch) {
+      leaderAndISRRequest.partitionStateInfos.foreach {
+
+    case ((topic, partition), stateInfo) =>
+          stateChangeLogger.warn(("日志)
+      }
+
+
+      BecomeLeaderOrFollowerResult(responseMap,
+
+        ErrorMapping.StaleControllerEpochCode)
+    } else {
+
+这里得到当前请求的最新的epoch的值,并设置当前的broker的epoch的值为请求的值,
+      val controllerId = leaderAndISRRequest.controllerId
+      val correlationId = leaderAndISRRequest.correlationId
+      controllerEpoch = leaderAndISRRequest.controllerEpoch
+
+对请求的所有的partition进行迭代,并对partition的状态进行检查.
+      // First check partition's leader epoch
+      val partitionState = new mutable.HashMap[Partition, PartitionStateInfo]()
+      leaderAndISRRequest.partitionStateInfos.foreach {
+
+    case ((topic, partitionId), partitionStateInfo) =>
+
+这里通过getOrCreatePartition从allPartitions集合中得到这个partition的实例,如果这个partition的实例在集合中不存在时,会创建这个实例.
+          val partition = getOrCreatePartition(topic, partitionId)
+          val partitionLeaderEpoch = partition.getLeaderEpoch()
+
+
+
+检查当前的partition中的leaderEpoch的值是否小于新请求的值,如果小于这个值,同时这个partition对应的副本包含有当前的broker时,把这个partition与状态添加到partitionState的集合中,否则表示当前的broker中不包含这个partition的副本,打印一个日志,并在responseMap中记录这个partition的error code为UnknownTopicOrPartitionCode.如果partition的leaderEpoch的值大于或等于请求的epoch的值,打印日志,并在responseMap中添加这个partition的error code的值为StaleLeaderEpochCode.
+          if (partitionLeaderEpoch < partitionStateInfo.
+
+             leaderIsrAndControllerEpoch.leaderAndIsr.leaderEpoch) {
+            if(partitionStateInfo.allReplicas.contains(config.brokerId))
+              partitionState.put(partition, partitionStateInfo)
+            else {
+              stateChangeLogger.warn(("日志)
+
+
+              responseMap.put((topic, partitionId),
+
+             ErrorMapping.UnknownTopicOrPartitionCode)
+            }
+          } else {
+            // Otherwise record the error code in response
+            stateChangeLogger.warn(("日志)
+            responseMap.put((topic, partitionId), ErrorMapping.StaleLeaderEpochCode)
+          }
+      }
+
+
+这里根据partition的副本包含有当前的broker节点的所有的partition的集合,得到这个partition的leader是当前的broker的所有的partition的集合,同时得到包含有当前的broker的副本的partition中,leader不是当前的broker的所有的partition的集合.
+      val partitionsTobeLeader = partitionState.filter {
+
+    case (partition, partitionStateInfo) =>
+           partitionStateInfo.leaderIsrAndControllerEpoch.leaderAndIsr.leader ==
+
+             config.brokerId
+      }
+      val partitionsToBeFollower = (partitionState -- partitionsTobeLeader.keys)
+
+如果partitions需要被切换成leader的集合不为空,对这些需要在当前的broker中的partition执行leader操作的集合执行makeLeaders函数.这里得到的集合是partition中当前broker被搞成leader的partition集合,
+      val partitionsBecomeLeader = if (!partitionsTobeLeader.isEmpty)
+        makeLeaders(controllerId, controllerEpoch, partitionsTobeLeader,
+
+        leaderAndISRRequest.correlationId, responseMap)
+      else
+        Set.empty[Partition]
+
+
+
+如果partitions需要被切换成follower的集合不为空,对这些需要在当前的broker中的partition执行follower操作的集合执行makeFollowers函数.这里得到的集合是partition中当前broker被搞成follower的partition集合,
+      val partitionsBecomeFollower = if (!partitionsToBeFollower.isEmpty)
+        makeFollowers(controllerId, controllerEpoch, partitionsToBeFollower,
+
+      leaderAndISRRequest.correlationId, responseMap, metadataCache)
+      else
+        Set.empty[Partition]
+
+
+
+更新每个partition中最后一个offset的值到日志目录下的checkpoint文件中.
+      if (!hwThreadInitialized) {
+        startHighWaterMarksCheckPointThread()
+        hwThreadInitialized = true
+      }
+
+停止掉没有partition引用的fetcher的线程.这个线程用于对partition的消息的同步,从leader的partition中同步数据到follower中.
+      replicaFetcherManager.shutdownIdleFetcherThreads()
+
+这里根据当前节点是leader的partition集合与当前节点变成follower的partition集合,检查这些partition对应的topic是否是__consumer_offsets topic,这个topic用来记录每个consumer对应的消费的offset的信息,如果是这个topic的partition时,根据leader与follower的集合,通过GroupMetadataManager实例对两个集合分别执行partition的leader的上线与下线的操作.
+      onLeadershipChange(partitionsBecomeLeader, partitionsBecomeFollower)
+      BecomeLeaderOrFollowerResult(responseMap, ErrorMapping.NoError)
+    }
+  }
+}
+
+
+Partition的leader设置
+
+在LeaderAndIsr的请求过来时,如果请求的消息中对应的partition的leader是当前的broker节点时,会根据这个partitions的集合执行ReplicaManager.makeLeaders的操作,
+
+ */
+private def makeLeaders(controllerId: Int,
+                        epoch: Int,
+                        partitionState: Map[Partition, PartitionStateInfo],
+                        correlationId: Int,
+                        responseMap: mutable.Map[(String, Int), Short])
+
+: Set[Partition] = {
+  partitionState.foreach(state =>
+    stateChangeLogger.trace(这里打印日志)
+
+对所有要把当前节点设置成leader的partition设置为NoError的错误代码,这个表示没有错误.
+  for (partition <- partitionState.keys)
+    responseMap.put((partition.topic, partition.partitionId),
+
+       ErrorMapping.NoError)
+
+  val partitionsToMakeLeaders: mutable.Set[Partition] = mutable.Set()
+
+  try {
+
+
+
+这里从同步partition的消息的线程中移出需要在当前的broker中成为Leader的partition.
+    // First stop fetchers for all the partitions
+    replicaFetcherManager.removeFetcherForPartitions(
+
+       partitionState.keySet.map(new TopicAndPartition(_)))
+
+
+
+这里根据需要在当前的broker中设置成leader的partition的集合进行迭代,根据迭代的Partition实例中的makeLeader函数来设置partition的leader,并得到成功设置leader的所有的partition的集合(如果partition的leader本身就在这个broker上,这个函数返回的值为false).这个函数的最后返回这个被生成设置leader的partitions的集合.
+    // Update the partition information to be the leader
+    partitionState.foreach{ case (partition, partitionStateInfo) =>
+      if (partition.makeLeader(controllerId, partitionStateInfo, correlationId))
+        partitionsToMakeLeaders += partition
+      else
+        stateChangeLogger.info(("日志"));
+    }
+    partitionsToMakeLeaders.foreach { partition =>
+      stateChangeLogger.trace(日志)
+    }
+  } catch {
+    case e: Throwable =>
+      partitionState.foreach { state =>
+        val errorMsg = ("Error on broker %d while processing LeaderAndIsr request
+
+            correlationId %d received from controller %d" +
+            " epoch %d for partition %s").format(localBrokerId, correlationId,
+
+                                              controllerId, epoch,
+                                              TopicAndPartition(state._1.topic,
+
+                                              state._1.partitionId))
+        stateChangeLogger.error(errorMsg, e)
+      }
+      // Re-throw the exception for it to be caught in KafkaApis
+      throw e
+  }
+
+  partitionState.foreach { state =>
+    stateChangeLogger.trace(日志)
+  }
+
+  partitionsToMakeLeaders
+}
+
+
+
+Partition中的makeLeader函数:
+
+这个函数,根据当前的borker,把当前的broker设置成partition的leader.这个函数返回true,表示是新生成的leader,返回false表示可能原来这个partition的leader就是当前的broker.
+
+
+def makeLeader(controllerId: Int, partitionStateInfo: PartitionStateInfo, correlationId: Int): Boolean = {
+
+
+  val (leaderHWIncremented, isNewLeader) = inWriteLock(leaderIsrUpdateLock) {
+
+得到当前请求的所有对应此partition的副本集合与isr的副本顺序集合.
+    val allReplicas = partitionStateInfo.allReplicas
+    val leaderIsrAndControllerEpoch =
+
+            partitionStateInfo.leaderIsrAndControllerEpoch
+    val leaderAndIsr = leaderIsrAndControllerEpoch.leaderAndIsr
+    controllerEpoch = leaderIsrAndControllerEpoch.controllerEpoch
+
+
+
+这里根据这个partition的新的副本集合,在partition中的assignedReplicaMap集合中得到这个副本的定义信息,如果这个副本不存在,创建这个副本,并添加到这个集合中.
+
+创建副本的流程:
+
+1,如果副本对应的brokerid是当前的brokerid时,表示这是local的副本实例,生成副本实例时,根据当前这个partition的checkpoint的offset(如果没有,offset设置为0,如果checkpoint的offset大于当前log中最大的offset时,到log中最大的offset),并生成这个副本的Log实例通过LogManager中的createLog来生成,生成Log的存储路径时,Log的存储路径选择原则是从所有的磁盘中选择partition个数最少的磁盘来生成Log的存储目录.
+
+此处使用到的checkpoint是对应的replication-offset-checkpoint文件
+
+2,如果副本对应的brokerId不是当前的broker时,表示这是一个removte的副本,直接根据当前的partition的实例与副本对应的broker生成副本实例Replica.
+    // add replicas that are new
+    allReplicas.foreach(replica => getOrCreateReplica(replica))
+
+
+
+得到isr的副本顺序集合对应的副本实例集合.
+    val newInSyncReplicas = leaderAndIsr.isr.map(r => getOrCreateReplica(r)).toSet
+
+
+
+移出这个partition中原来老的副本集合,
+
+      也就是不包含这次请求的副本集合的副本从assignedReplicaMap集合中.
+    // remove assigned replicas that have been removed by the controller
+    (assignedReplicas().map(_.brokerId) -- allReplicas).foreach(removeReplica(_))
+    inSyncReplicas = newInSyncReplicas
+    leaderEpoch = leaderAndIsr.leaderEpoch
+    zkVersion = leaderAndIsr.zkVersion
+
+如果当前partition的leaderid就是当前的brokerId,表示这不是一个新创建的leader,否则表示这是一个新创建的leader,设置leaderReplicaIdOpt属性的值为当前的brokerId.
+    val isNewLeader =
+      if (leaderReplicaIdOpt.isDefined && leaderReplicaIdOpt.get == localBrokerId)
+
+      {
+        false
+      } else {
+        leaderReplicaIdOpt = Some(localBrokerId)
+        true
+      }
+
+
+
+得到当前broker节点的Replica的实例,这个实例其实就是partition的leaderReplica的实例.
+    val leaderReplica = getReplica().get
+    // we may need to increment high watermark since ISR could be down to 1
+    if (isNewLeader) {
+
+如果当前的leaderReplica在当前的broker中是新生成出来的leader时,
+
+设置这个Replica中的highWatermarkMetadata属性的值为当前Log中activeSegment的nextOffset,activeSegment的baseOffset与当前的activeSegment的大小(下次写的position)
+      // construct the high watermark metadata for the new leader replica
+      leaderReplica.convertHWToLocalOffsetMetadata()
+
+
+
+设置所有remote的副本的logEndOffset的值为-1.
+      // reset log end offset for remote replicas
+      assignedReplicas.filter(_.brokerId != localBrokerId)
+
+         .foreach(_.updateLogReadResult(LogReadResult.UnknownLogReadResult))
+    }
+    (maybeIncrementLeaderHW(leaderReplica), isNewLeader)
+  }
+  // some delayed operations may be unblocked after HW changed
+  if (leaderHWIncremented)
+    tryCompleteDelayedRequests()
+  isNewLeader
+}
+
+
+Partition的follower设置
+
+在LeaderAndIsr的请求过来时,如果请求的消息中对应的partition的leader不是当前的broker节点时,会根据这个partitions的集合执行ReplicaManager.makeFollowers的操作,
+
+ */
+private def makeFollowers(controllerId: Int,
+                          epoch: Int,
+                          partitionState: Map[Partition, PartitionStateInfo],
+                          correlationId: Int,
+                          responseMap: mutable.Map[(String, Int), Short],
+                          metadataCache: MetadataCache) : Set[Partition] = {
+  partitionState.foreach { state =>
+    stateChangeLogger.trace(先打印日志,)
+  }
+
+设置所有的partiton的响应的代码为NoError.
+  for (partition <- partitionState.keys)
+    responseMap.put((partition.topic, partition.partitionId),
+
+        ErrorMapping.NoError)
+
+  val partitionsToMakeFollower: mutable.Set[Partition] = mutable.Set()
+
+  try {
+
+    // TODO: Delete leaders from LeaderAndIsrRequest
+    partitionState.foreach{ case (partition, partitionStateInfo) =>
+      val leaderIsrAndControllerEpoch =
+
+            partitionStateInfo.leaderIsrAndControllerEpoch
+      val newLeaderBrokerId = leaderIsrAndControllerEpoch.leaderAndIsr.leader
+      metadataCache.getAliveBrokers.find(_.id == newLeaderBrokerId) match {
+        // Only change partition state when the leader is available
+        case Some(leaderBroker) =>
+
+这里得到当前新的leader所在的broker,这里表示当前的cache中包含有partition新的leader的broker的缓存,直接通过Partition实例中的makeFollower来对这个partition执行follower操作,如果这个函数返回true表示原来这个broker是一个leader节点,现在变成了follower节点,如果返回false表示这个broker原来就是follower不需要改变.根据返回是true的值返回所有从leader变成follower的partition的集合.
+          if (partition.makeFollower(controllerId, partitionStateInfo,
+
+                    correlationId))
+            partitionsToMakeFollower += partition
+          else
+            stateChangeLogger.info(打印日志,这里是没有新添加当前副本为follower)
+        case None =>
+          stateChangeLogger.error(这里打印的日志表示没有找到当前的partition的leader)
+
+
+
+这当前的partition在当前的broker中生成一个Replica,这个副本包含Log实例,这个时候创建这个partition的本地副本是为了保存这个parition的offset的replication-offset-checkpoint文件的内容.
+          partition.getOrCreateReplica()
+      }
+    }
+
+移出partition的副本修改成follower成功的副本对应的partition集合的fetcher线程.
+    replicaFetcherManager.removeFetcherForPartitions(
+
+      partitionsToMakeFollower.map(new TopicAndPartition(_)))
+    partitionsToMakeFollower.foreach { partition =>
+      stateChangeLogger.trace(打印日志,这里是当前broker中被标记为follower的partition)
+    }
+
+根据当前broker中对应的partition的副本的replication-offset-checkpoint的offset,对partition的log进行截断,同时把截断的offset存储到recovery-point-offset-checkpoint文件中,这个用于恢复partition时开始读取的数据的offset.
+
+针对replication-offset-checkpoint文件定期进行checkpoint的时间为默认情况下每5秒一次.
+
+通过replica.high.watermark.checkpoint.interval.ms配置.
+
+针对recovery-point-offset-checkpoint文件定期进行checkpoint的默认为60秒一次,
+
+通过log.flush.offset.checkpoint.interval.ms配置.
+    logManager.truncateTo(partitionsToMakeFollower.map(
+
+      partition => (new TopicAndPartition(partition),
+
+        partition.getOrCreateReplica().highWatermark.messageOffset)
+
+      ).toMap)
+
+    partitionsToMakeFollower.foreach { partition =>
+      stateChangeLogger.trace(打印日志)
+    }
+
+    if (isShuttingDown.get()) {
+      partitionsToMakeFollower.foreach { partition =>
+        stateChangeLogger.trace(当前broker正在进行shutdown,打印日志)
+      }
+
+
+    } else {
+
+如果当前的broker并没有停止,根据被切花成follower的partition的集合中当前的leader的broker的节点的连接信息,并根据当前broker中副本的log的最后一个offset的值生成网络连接的endpoint实例,通过ReplicaFetcherManager实例生成用于副本数据同步的createFetcherThread线程,向对应的leader broker中同步数据.同步数据的间隔周期通过replica.fetch.backoff.ms配置,默认为1秒.
+
+在同步消息的过程中,每同步一条数据,会修改当前broker中副本的highWatermark属性的值.
+      val partitionsToMakeFollowerWithLeaderAndOffset =
+
+        partitionsToMakeFollower.map(partition =>
+          new TopicAndPartition(partition) -> BrokerAndInitialOffset(
+            metadataCache.getAliveBrokers.find(_.id ==
+
+               partition.leaderReplicaIdOpt.get
+
+            ).get.getBrokerEndPoint(config.interBrokerSecurityProtocol),
+               partition.getReplica().get.logEndOffset.messageOffset)
+
+          ).toMap
+
+
+      replicaFetcherManager.addFetcherForPartitions(
+
+             partitionsToMakeFollowerWithLeaderAndOffset)
+
+      partitionsToMakeFollower.foreach { partition =>
+        stateChangeLogger.trace(打印日志)
+      }
+    }
+  } catch {
+    case e: Throwable =>
+      val errorMsg = (出现错误,打印日志)
+      stateChangeLogger.error(errorMsg, e)
+      // Re-throw the exception for it to be caught in KafkaApis
+      throw e
+  }
+
+  partitionState.foreach { state =>
+    stateChangeLogger.trace(打印日志)
+  }
+
+  partitionsToMakeFollower
+}
+
+
+
+Partition中的makeFollower函数:
+
+ */
+def makeFollower(controllerId: Int, partitionStateInfo: PartitionStateInfo, correlationId: Int): Boolean = {
+  inWriteLock(leaderIsrUpdateLock) {
+
+得到当前的partition的所有的副本信息与副本对应的leader的isr的副本顺序集合.
+    val allReplicas = partitionStateInfo.allReplicas
+    val leaderIsrAndControllerEpoch =
+
+         partitionStateInfo.leaderIsrAndControllerEpoch
+    val leaderAndIsr = leaderIsrAndControllerEpoch.leaderAndIsr
+
+
+
+得到当前新的leader的id.
+    val newLeaderBrokerId: Int = leaderAndIsr.leader
+
+
+    controllerEpoch = leaderIsrAndControllerEpoch.controllerEpoch
+
+迭代partition的所有的副本,如果副本不存在,创建副本的实例,如果副本对应的broker是当前的broker时,生成副本实例时会同时生成Log实例,在执行副本数据的同步时,会通过log中当前最大的offset向leader节点去同步数据.当前log中最大的offset是在副本变成follower时根据当前的副本对应的highWatermark属性得到的值.
+    // add replicas that are new
+    allReplicas.foreach(r => getOrCreateReplica(r))
+
+
+
+得到partition中需要移出的副本并从assignedReplicaMap集合中移出这个副本.
+    // remove assigned replicas that have been removed by the controller
+    (assignedReplicas().map(_.brokerId) -- allReplicas).foreach(removeReplica(_))
+    inSyncReplicas = Set.empty[Replica]
+    leaderEpoch = leaderAndIsr.leaderEpoch
+    zkVersion = leaderAndIsr.zkVersion
+
+如果当前partition的leader的副本与请求的新的leader是同一个broker,表示当前节点的的副本状态并没有发生什么变化,这个函数返回false.
+    if (leaderReplicaIdOpt.isDefined && leaderReplicaIdOpt.get==newLeaderBrokerId)
+
+{
+      false
+    }
+    else {
+
+否则,这种情况下,函数返回值,并设置partition的leader的副本为请求过来的新的leader对应的brokerId的值.
+      leaderReplicaIdOpt = Some(newLeaderBrokerId)
+      true
+    }
+  }
+}
+
+
+对于consumer_offsets的topic处理
+
+当执行对topic中某个partition的leader的变化后，如果这个topic是__consumer_offsets的topic时，通过GroupCoordinator实例中handleGroupImmigration来处理parition的leader上线，通过handleGroupEmigration来处理partition的leader下线。
+
+GroupCoordinator实例在KafkaServer启动时，对应其中的组件为consumerCoordinator。
+
+这部分分析参见GroupCoornirator中的group元数据的partition的leader上线与下线处理流程。
+处理StopReplica请求
+
+stopReploca的请求在对一个topic进行删除操作时，或者在一个broker节点下线后这个节点中有partition的副本设置为一个副本时会执行这个操作。这个操作接收请求的broker对应的是partition的副本所在的节点才会接收到请求。
+
+case RequestKeys.StopReplicaKey => handleStopReplicaRequest(request)
+
+
+
+接下来我们看看用于处理副本下线的handleStopReplicaRequest函数操作流程:
+
+
+def handleStopReplicaRequest(request: RequestChannel.Request) {
+  val stopReplicaRequest = request.requestObj.asInstanceOf[StopReplicaRequest]
+
+验证当前的session是否有执行ClusterAction操作的权限。
+  authorizeClusterAction(request)
+
+通过replicaManager执行副本的停止操作，
+
+1,从replicaFetcherManager实例中移出针对副本的partition从leader同步数据的操作。
+
+2,根据副本的停止操作传入的参数是否需要删除partition(true/false),如果是false时，什么都不做，如果是true时(只有这个topic被标记为删除后，这个值才会是true)，从allPartitions集合中移出这个partition,同时从LogManager中删除这个partition对应的log的所有的segment.
+  val (response, error) = replicaManager.stopReplicas(stopReplicaRequest)
+
+
+
+生成向请求端进行响应结果的内容，主要是操作是否有错误的提示信息。
+  val stopReplicaResponse = new StopReplicaResponse(
+
+           stopReplicaRequest.correlationId, response.toMap, error)
+
+
+  requestChannel.sendResponse(new Response(request,
+
+        new RequestOrResponseSend(request.connectionId, stopReplicaResponse)))
+
+
+
+停止掉没有引用的fetcher的线程，这个线程用于follower的副本从leader中同步数据的操作。
+  replicaManager.replicaFetcherManager.shutdownIdleFetcherThreads()
+}
+
+
+处理Topic Metadata请求
+
+这个操作通过在producer或者consumer的client端中，需要对topic进行消息处理时，要得到对应的topic的metadata的信息(partition配置信息)时，会先向broker中发起一个metadata的请求。
+
+case RequestKeys.MetadataKey => handleTopicMetadataRequest(request)
+
+
+
+这个请求在KafkaApis中通过对应的handleTopicMetadataRequest函数来处理，在处理时，把请求转换成一个TopicMetadataRequest请求。
+def handleTopicMetadataRequest(request: RequestChannel.Request) {
+  val metadataRequest = request.requestObj.asInstanceOf[TopicMetadataRequest]
+
+
+
+这里根据请求是否指定了topic来判断metadata的更新请求需要操作的topic的信息,如果请求的topic集合是一个空的集合,表示更新topic的请求是对所有的topic进行更新,否则直接取出请求的topic的集合.
+  val topics = if (metadataRequest.topics.isEmpty) {
+    val topicResponses = metadataCache.getTopicMetadata(
+
+         metadataRequest.topics.toSet, request.securityProtocol)
+
+
+    topicResponses.map(_.topic).filter(topic => authorize(request.session,
+
+         Describe, new Resource(Topic, topic))).toSet
+  } else {
+    metadataRequest.topics.toSet
+  }
+
+验证用户是否有操作的Describe权限,并得到能进行操作的topic集合与不能进行操作的topic集合.
+  var (authorizedTopics, unauthorizedTopics) = topics.partition(topic =>
+
+       authorize(request.session, Describe, new Resource(Topic, topic)))
+
+  if (!authorizedTopics.isEmpty) {
+
+如果被认证通过的topic的集合中包含数据,根据这些topic得到topic的meta的信息,如果每个partition的leader的连接信息等.
+    val topicResponses = metadataCache.getTopicMetadata(authorizedTopics,
+
+              request.securityProtocol)
+
+如果自动创建topic的auto.create.topics.enable配置设置为true时(默认值也是true),同时得到的topic的meta信息的集合个数没有认证通过的topic个数表示有topic没有被创建,标记这些topic为没创建的topic.
+    if (config.autoCreateTopicsEnable && topicResponses.size !=
+
+              authorizedTopics.size) {
+      val nonExistentTopics: Set[String] = topics --
+
+                       topicResponses.map(_.topic).toSet
+
+
+
+检查当前的用户是否有执行topic的创建的权限,也就是用户是否有Create权限,如果没有把没创建的topic集合从authorizedTopics集合中移出.并添加到unauthorizedTopics集合中,表示没认证通过.
+      authorizer.foreach {az =>
+
+        if (!az.authorize(request.session, Create, Resource.ClusterResource)) {
+          authorizedTopics --= nonExistentTopics
+          unauthorizedTopics ++= nonExistentTopics
+        }
+      }
+    }
+  }
+
+设置未认证通过的topic的集合的metadata为TopicAuthorizationCode代码.
+  val unauthorizedTopicMetaData = unauthorizedTopics.map(topic =>
+
+new TopicMetadata(topic, Seq.empty[PartitionMetadata],
+
+    ErrorMapping.TopicAuthorizationCode))
+
+根据认证通过后的topic的集合,得到这个集合中topic的meta信息,包含每个partition的副本与连接信息.如果topic不存在时同时配置自动创建topic的值为true时,会自动创建topic.
+
+自动创建topic时:
+
+如果topic是用于记录offset的topic(__consumer_offsets)时,topic创建partition个数默认是50个.通过offsets.topic.num.partitions配置.
+
+topic的副本份数通过offsets.topic.replication.factor配置.默认值3(如果broker达不到3时,使用broker的个数).
+
+如果是普通的topic时,partition个数通过配置num.partitions,默认是1,
+
+副本份数通过default.replication.factor配置,默认是1.
+  val topicMetadata = if (authorizedTopics.isEmpty) Seq.empty[TopicMetadata]
+
+else getTopicMetadata(authorizedTopics, request.securityProtocol)
+
+
+
+得到所有存活的brokers的集合.
+  val brokers = metadataCache.getAliveBrokers
+  trace(日志)
+
+
+  val response = new TopicMetadataResponse(
+
+brokers.map(_.getBrokerEndPoint(request.securityProtocol)),
+
+topicMetadata  ++ unauthorizedTopicMetaData, metadataRequest.correlationId)
+
+
+  requestChannel.sendResponse(new RequestChannel.Response(request,
+
+new RequestOrResponseSend(request.connectionId, response)))
+}
+
+
+处理Produce请求
+
+通过执行KafkaApis中的handleProducerRequest函数来进行处理.
+
+在执行这个函数时,会通过配置的authorize的实例,执行对Write操作对应此Topic的认证.
+
+这里通过把认证成功的消息与认证不成功的消息分别存储到两个不同的集合中,
+
+如果authorize函数返回的值是true表示认证成功,放到authorizedRequestInfo集合中.
+
+如果authorize函数返回的值是false表示认证失败,放到unauthorizedRequestInfo集合中.
+
+val (authorizedRequestInfo, unauthorizedRequestInfo) =  produceRequest.data.partition  {
+  case (topicAndPartition, _) => authorize(request.session, Write,
+
+       new Resource(Topic, topicAndPartition.topic))
+}
+
+
+
+在这个函数中,主要通过replicaManager实例中的appendMessages函数来处理对消息的添加.
+
+具体请参见replicaManager中appendMessages的实现流程.
+
+
+
+这里,如果authorizedRequestInfo的集合是一个空的集合,表示传过来的消息对应的topic认证不合法.不做消息的添加操作,直接向client端响应.否则表示有成功认证的消息,执行else部分的操作.
+
+if (authorizedRequestInfo.isEmpty)
+  sendResponseCallback(Map.empty)
+else {
+  val internalTopicsAllowed = produceRequest.clientId == AdminUtils.AdminClientId
+
+执行消息的添加操作,这里通过replicaManager组合中的处理消息追加来进行处理。
+  // call the replica manager to append messages to the replicas
+  replicaManager.appendMessages(
+    produceRequest.ackTimeoutMs.toLong,
+    produceRequest.requiredAcks,
+    internalTopicsAllowed,
+    authorizedRequestInfo,
+    sendResponseCallback)
+
+  // if the request is put into the purgatory, it will have a held reference
+  // and hence cannot be garbage collected; hence we clear its data here in
+  // order to let GC re-claim its memory since it is already appended to log
+  produceRequest.emptyData()
+}
+
+
+
+关于消息添加后向client端进行响应的sendResponseCallback函数:
+
+// the callback for sending a produce response
+def sendResponseCallback(responseStatus: Map[TopicAndPartition,
+
+        ProducerResponseStatus]) {
+这里先得到所有的要响应的消息,包含认证失败的消息.
+  val mergedResponseStatus = responseStatus ++ unauthorizedRequestInfo
+
+     .mapValues(_ =>
+
+         ProducerResponseStatus(ErrorMapping.TopicAuthorizationCode, -1))
+
+  var errorInResponse = false
+这里检查是否有认证失败或者处理失败的消息.
+  mergedResponseStatus.foreach { case (topicAndPartition, status) =>
+    if (status.error != ErrorMapping.NoError) {
+      errorInResponse = true
+      debug("Produce request with correlation id %d from client %s on partition %s
+
+        failed due to %s".format(
+        produceRequest.correlationId,
+        produceRequest.clientId,
+        topicAndPartition,
+        ErrorMapping.exceptionNameFor(status.error)))
+    }
+  }
+
+  def produceResponseCallback(delayTimeMs: Int) {
+
+    if (produceRequest.requiredAcks == 0) {
+
+如果请求的ack设置为0,表示不需要向client端进行响应,如果有认证失败的消息,向socket server发起关闭连接的请求,否则发起没有操作的请求.
+      if (errorInResponse) {
+        val exceptionsSummary = mergedResponseStatus.map {
+
+          case (topicAndPartition, status) =>
+            topicAndPartition -> ErrorMapping.exceptionNameFor(status.error)
+        }.mkString(", ")
+
+
+        info(
+          s"Closing connection due to error during produce request with correlation
+
+            id ${produceRequest.correlationId} " +
+            s"from client id ${produceRequest.clientId} with ack=0\n" +
+            s"Topic and partition to exceptions: $exceptionsSummary"
+        )
+        requestChannel.closeConnection(request.processor, request)
+      } else {
+        requestChannel.noOperation(request.processor, request)
+      }
+    } else {
+
+这种情况下,需要向client端进行消息,把所有的消息生成一个ProducerResponse的请求,直接向client端发起写操作,这个过程通过socket server中的send操作来完成.
+      val response = ProducerResponse(produceRequest.correlationId,
+                                      mergedResponseStatus,
+                                      produceRequest.versionId,
+                                      delayTimeMs)
+      requestChannel.sendResponse(new RequestChannel.Response(request,
+            new RequestOrResponseSend(request.connectionId,
+
+            response)))
+    }
+  }
+
+  // When this callback is triggered, the remote API call has completed
+  request.apiRemoteCompleteTimeMs = SystemTime.milliseconds
+
+这里向client端发起响应操作,通过上面的produceResponseCallback的内部实现.
+  quotaManagers(RequestKeys.ProduceKey)
+
+     .recordAndMaybeThrottle(produceRequest.clientId,
+                                  numBytesAppended,
+                                  produceResponseCallback)
+}
+
+
+
+
+处理GroupMedatadata请求
+
+这个请求主要用于通过一个对应的groupId的值，得到这个groupId的metadata的信息.
+
+主要是通过groupId与存储consumer的消费的offset记录的topic的总的partitions的个数取模，得到这个groupId对应的存储partition的leader信息。
+
+case RequestKeys.GroupCoordinatorKey => handleGroupCoordinatorRequest(request)
+
+
+
+来看看这个handleGroupCoordinatorRequest函数的处理流程：
+
+
+def handleGroupCoordinatorRequest(request: RequestChannel.Request) {
+  val groupCoordinatorRequest = request.body.asInstanceOf[GroupCoordinatorRequest]
+  val responseHeader = new ResponseHeader(request.header.correlationId)
+
+  if (!authorize(request.session, Describe, new Resource(Group,
+
+                groupCoordinatorRequest.groupId))) {
+
+
+
+如果认证不通过，表示当前的session没有操作这个Describe的权限，
+
+         返回消息的响应代码为GROUP_AUTHORIZATION_FAILED。
+    val responseBody = new GroupCoordinatorResponse(
+
+              Errors.GROUP_AUTHORIZATION_FAILED.code, Node.noNode)
+    requestChannel.sendResponse(new RequestChannel.Response(request,
+
+         new ResponseSend(request.connectionId, responseHeader, responseBody)))
+  } else {
+
+流程执行到这里，表示认证已经通过。
+
+这里通过在KafkaServer中生成的GroupCoonrdinator实例中，根据当前的groupId的hash值与用于存储group的offset消费记录的topic的partitions的个数进行取模操作得到这个groupId对应的partition的下标。
+    val partition = coordinator.partitionFor(groupCoordinatorRequest.groupId)
+
+得到用于存储消费者信息的topic对应的所有的TopicMedatadata的信息，包含这个topic的partitions的定义与partition的副本集合与leader信息。
+    // get metadata (and create the topic if necessary)
+    val offsetsTopicMetadata = getTopicMetadata(
+
+                Set(GroupCoordinator.GroupMetadataTopicName),
+
+                request.securityProtocol).head
+
+
+
+根据请求的groupId对应的存储记录的partition的下标，得到这个partitoion的leader信息，
+    val coordinatorEndpoint = offsetsTopicMetadata.partitionsMetadata.find(
+
+           _.partitionId == partition)
+
+.flatMap {
+      partitionMetadata => partitionMetadata.leader
+    }
+
+如果没有找到这个groupId对应的partition的leader的broker节点，
+
+          返回的响应代码为GROUP_COORDINATOR_NOT_AVAILABLE。
+
+否则返回这个leader的broker节点的连接信息，这时响应代码为NONE。
+    val responseBody = coordinatorEndpoint match {
+      case None =>
+        new GroupCoordinatorResponse(Errors.GROUP_COORDINATOR_NOT_AVAILABLE.code,
+
+          Node.noNode())
+      case Some(endpoint) =>
+        new GroupCoordinatorResponse(Errors.NONE.code,
+
+          new Node(endpoint.id, endpoint.host, endpoint.port))
+    }
+
+    trace("Sending consumer metadata %s for correlation id %d to client %s."
+      .format(responseBody, request.header.correlationId,
+
+        request.header.clientId))
+
+
+    requestChannel.sendResponse(new RequestChannel.Response(request,
+
+     new ResponseSend(request.connectionId, responseHeader, responseBody)))
+  }
+}
+
+
+处理JoinGroup请求
+
+这个请求主要是当一个consumer开始进行数据消费时，会通过groupId对应的记录消费metadata信息的partition的leader节点发起一个JoinGroup的请求，
+
+case RequestKeys.JoinGroupKey => handleJoinGroupRequest(request)
+
+
+
+接下来看看handleJoinGroupRequest函数的处理流程：
+
+
+def handleJoinGroupRequest(request: RequestChannel.Request) {
+  import JavaConversions._
+
+  val joinGroupRequest = request.body.asInstanceOf[JoinGroupRequest]
+  val responseHeader = new ResponseHeader(request.header.correlationId)
+
+定义一个用于处理请求的响应的函数。
+  // the callback for sending a join-group response
+  def sendResponseCallback(joinResult: JoinGroupResult) {
+    val members = joinResult.members map { case (memberId, metadataArray) =>
+
+            (memberId, ByteBuffer.wrap(metadataArray)) }
+    val responseBody = new JoinGroupResponse(joinResult.errorCode,
+
+           joinResult.generationId, joinResult.subProtocol,
+           joinResult.memberId, joinResult.leaderId, members)
+
+    trace("Sending join group response %s for correlation id %d to client %s."
+      .format(responseBody, request.header.correlationId,
+
+         request.header.clientId))
+
+
+    requestChannel.sendResponse(new RequestChannel.Response(request,
+
+       new ResponseSend(request.connectionId, responseHeader, responseBody)))
+  }
+
+  if (!authorize(request.session, Read,
+
+          new Resource(Group, joinGroupRequest.groupId()))) {
+
+首先认证session是否具有读取的权限，如果没有，直接响应结果，不执行处理。
+
+返回的代码为GroupAuthorizationCode。
+    val responseBody = new JoinGroupResponse(
+      ErrorMapping.GroupAuthorizationCode,
+      JoinGroupResponse.UNKNOWN_GENERATION_ID,
+      JoinGroupResponse.UNKNOWN_PROTOCOL,
+      JoinGroupResponse.UNKNOWN_MEMBER_ID, // memberId
+      JoinGroupResponse.UNKNOWN_MEMBER_ID, // leaderId
+      Map.empty[String, ByteBuffer])
+
+
+    requestChannel.sendResponse(new RequestChannel.Response(request,
+
+        new ResponseSend(request.connectionId, responseHeader, responseBody)))
+  } else {
+
+这里得到用于执行partition分配的处理实例的名称与对应的订阅的topic.
+    // let the coordinator to handle join-group
+    val protocols = joinGroupRequest.groupProtocols().map(protocol =>
+      (protocol.name, Utils.toArray(protocol.metadata))).toList
+
+
+
+
+
+通过consumerCoordinator实例（GroupCoordinator实现）来处理对consumer中groupId的join的请求。可以参见GroupCoordinator中的处理group的加入
+    coordinator.handleJoinGroup(
+      joinGroupRequest.groupId,
+      joinGroupRequest.memberId,
+      request.header.clientId,
+      request.session.clientAddress.toString,
+      joinGroupRequest.sessionTimeout,
+      joinGroupRequest.protocolType,
+      protocols,
+      sendResponseCallback)
+  }
+}
+
+
+处理SyncGroup请求
+
+这个请求主要是当一个consumer通过joinGroup得到加入到group成功后如果当前的consumer是group中的leader的member时(follower也会发起这个消息，但member对应的分配集合为空集合)，在分配完成所有的member的partition的消费信息后，
+
+向coordinator的broker节点发起的syncGroup的请求，这个请求传入的是每个member对应的分配信息.
+
+case RequestKeys.SyncGroupKey => handleSyncGroupRequest(request)
+
+接下来看看函数具体实现流程：
+
+def handleSyncGroupRequest(request: RequestChannel.Request) {
+  import JavaConversions._
+
+  val syncGroupRequest = request.body.asInstanceOf[SyncGroupRequest]
+
+生成一个用于向client端响应结果的处理函数。
+  def sendResponseCallback(memberState: Array[Byte], errorCode: Short) {
+    val responseBody = new SyncGroupResponse(errorCode,
+
+               ByteBuffer.wrap(memberState))
+    val responseHeader = new ResponseHeader(request.header.correlationId)
+
+
+
+    requestChannel.sendResponse(new Response(request,
+
+        new ResponseSend(request.connectionId, responseHeader, responseBody)))
+  }
+
+  if (!authorize(request.session, Read,
+
+         new Resource(Group, syncGroupRequest.groupId()))) {
+    sendResponseCallback(Array[Byte](), ErrorMapping.GroupAuthorizationCode)
+  } else {
+
+这里直接通过GroupCoordinator中对应的handleSyncGroup来进行处理，
+
+这里主要是接收到所有的member的请求，并等待leader member的请求过来进行处理后，统一向所有的member回写分配后的partitions的信息。
+
+参见GroupCoordinator中处理consumer分配后的group同步.
+    coordinator.handleSyncGroup(
+      syncGroupRequest.groupId(),
+      syncGroupRequest.generationId(),
+      syncGroupRequest.memberId(),
+      syncGroupRequest.groupAssignment().mapValues(Utils.toArray(_)),
+      sendResponseCallback
+    )
+  }
+}
+
+
+
+
+接收Consumer的心跳
+
+当一个consumer成功完成分配的partition后，会向coonrdinator对应的broker节点定时发起心跳操作，用来保证这个consumer与group的连接，如果在session的超时时间内没有心跳发过来时，表示这个member已经超时，会从对应的group中称出这个member,并重新执行rebalance的操作.
+
+case RequestKeys.HeartbeatKey => handleHeartbeatRequest(request)
+
+
+
+下面来看看handleHeartbeatRequest函数的处理流程：
+
+def handleHeartbeatRequest(request: RequestChannel.Request) {
+  val heartbeatRequest = request.body.asInstanceOf[HeartbeatRequest]
+  val respHeader = new ResponseHeader(request.header.correlationId)
+
+生成用于进行向client端回写的回调函数。
+  // the callback for sending a heartbeat response
+  def sendResponseCallback(errorCode: Short) {
+    val response = new HeartbeatResponse(errorCode)
+    trace("Sending heartbeat response %s for correlation id %d to client %s."
+      .format(response, request.header.correlationId, request.header.clientId))
+
+
+    requestChannel.sendResponse(new RequestChannel.Response(request,
+
+        new ResponseSend(request.connectionId, respHeader, response)))
+  }
+
+  if (!authorize(request.session, Read,
+
+               new Resource(Group, heartbeatRequest.groupId))) {
+    val heartbeatResponse = new HeartbeatResponse(
+
+                  ErrorMapping.GroupAuthorizationCode)
+
+
+    requestChannel.sendResponse(new Response(request,
+
+        new ResponseSend(request.connectionId, respHeader, heartbeatResponse)))
+  }
+  else {
+
+直接通过GroupCoordinator实例中的handleHeartbeat函数来进行处理。
+    // let the coordinator to handle heartbeat
+    coordinator.handleHeartbeat(
+      heartbeatRequest.groupId(),
+      heartbeatRequest.memberId(),
+      heartbeatRequest.groupGenerationId(),
+      sendResponseCallback)
+  }
+}
+
+
+处理得到Offset的请求
+
+这个请求主要是用来得到当前的某个partition中，最新的offset的接口，当需要从某个partition中的最新的offset开始读取数据时，可以先通过这个接口来得到这个partition当前最新的offset,可以保证数据的读取时，能从最新的offset开始读取，而不用读取老的数据。
+
+case RequestKeys.OffsetsKey => handleOffsetRequest(request)
+
+接下来看看handleOffsetRequest的处理流程：
+/**
+ * Handle an offset request
+ */
+def handleOffsetRequest(request: RequestChannel.Request) {
+  val offsetRequest = request.requestObj.asInstanceOf[OffsetRequest]
+
+根据当前的session计算这个session是否具有操作Describe的权限。
+
+得到可以操作的partition的请求集合与不可操作的请求集合。
+  val (authorizedRequestInfo, unauthorizedRequestInfo) =
+
+            offsetRequest.requestInfo.partition  {
+    case (topicAndPartition, _) =>
+
+      authorize(request.session, Describe,
+
+         new Resource(Topic, topicAndPartition.topic))
+  }
+
+如果有没有权限的请求集合，生成这些请求的响应信息为TopicAuthorizationCode。
+  val unauthorizedResponseStatus = unauthorizedRequestInfo.mapValues(_ =>
+
+       PartitionOffsetsResponse(ErrorMapping.TopicAuthorizationCode, Nil))
+
+对认证通过的集合进行迭代，每一次的迭代得到一个请求得到offset的partition.
+  val responseMap = authorizedRequestInfo.map(elem => {
+    val (topicAndPartition, partitionOffsetRequestInfo) = elem
+    try {
+
+根据请求传入的参数，如果replica的值不是-2,表示这不是debug的请求，得到当前的leader的replica,这个leader必须在当前的broker节点,如果是debug模式时，得到当前的节点的replica实例，这个时候可以不考虑parition的leader在本地。
+      // ensure leader exists
+      val localReplica = if (!offsetRequest.isFromDebuggingClient)
+        replicaManager.getLeaderReplicaIfLocal(topicAndPartition.topic,
+
+             topicAndPartition.partition)
+      else
+        replicaManager.getReplicaOrException(topicAndPartition.topic,
+
+             topicAndPartition.partition)
+
+
+
+如果当前请求传入的replica的值不是-1时，得到fetchOffsets返回的所有结果，否则得到所有的副本中小于或等于当前节点的副本的最新的offset的所有副本的offset集合。
+
+在fetchOffsets函数中：
+
+1,如果请求的时间是LatestTime。根据请求要得到的offset的个数，从最后一个segment开始，如果需要得到的offset个数为1,那么fetchOffset得到的值就是当前最新的offset的值,如果请求需要得到的offset的个数是一个大于1的值，那么得到最后的几个segment中baseOffset的值，
+
+示例：请求得到的offset个数为3,共三个segment,第一个的baseoffset为100,第二个的baseoffset为200,第三个的baseoffset为300,最新的offset是350,
+
+那么：返回的offsets的集合中[0=350,1=300,2=200]
+
+2,如果请求的时间是EarliestTime。这个时候offsets的集合中只有一个值，就是最小的segment的baseoffset的值。
+      val offsets = {
+        val allOffsets = fetchOffsets(replicaManager.logManager,
+                                      topicAndPartition,
+                                      partitionOffsetRequestInfo.time,
+                                      partitionOffsetRequestInfo.maxNumOffsets)
+        if (!offsetRequest.isFromOrdinaryClient) {
+          allOffsets
+        } else {
+          val hw = localReplica.highWatermark.messageOffset
+          if (allOffsets.exists(_ > hw))
+            hw +: allOffsets.dropWhile(_ > hw)
+          else
+            allOffsets
+        }
+      }
+      (topicAndPartition, PartitionOffsetsResponse(ErrorMapping.NoError, offsets))
+    } catch {
+
+处理错误的情况,根据对应的错误生成错误代码返回。
+      case utpe: UnknownTopicOrPartitionException =>
+        debug("Offset request with correlation id %d from client %s on partition
+
+             %s failed due to %s".format(
+             offsetRequest.correlationId, offsetRequest.clientId,
+
+             topicAndPartition,
+
+             utpe.getMessage))
+        (topicAndPartition, PartitionOffsetsResponse(
+
+              ErrorMapping.codeFor(utpe.getClass.asInstanceOf[Class[Throwable]]),
+
+              Nil) )
+      case nle: NotLeaderForPartitionException =>
+        debug("Offset request with correlation id %d from client %s on partition
+
+             %s failed due to %s".format(
+             offsetRequest.correlationId, offsetRequest.clientId,
+
+             topicAndPartition,nle.getMessage))
+        (topicAndPartition, PartitionOffsetsResponse(
+
+             ErrorMapping.codeFor(nle.getClass.asInstanceOf[Class[Throwable]]),
+
+             Nil) )
+      case e: Throwable =>
+        error("Error while responding to offset request", e)
+        (topicAndPartition, PartitionOffsetsResponse(
+
+            ErrorMapping.codeFor(e.getClass.asInstanceOf[Class[Throwable]]),
+
+            Nil) )
+    }
+  })
+
+  val mergedResponseMap = responseMap ++ unauthorizedResponseStatus
+  val response = OffsetResponse(offsetRequest.correlationId, mergedResponseMap)
+  requestChannel.sendResponse(new RequestChannel.Response(request,
+
+       new RequestOrResponseSend(request.connectionId, response)))
+}
+
+
+处理group对应的消费的offset的读取请求
+
+这个请求的处理跟offset的请求处理的区别在于，offset请求得到的是请求的partition当前的最大或最小offset,而group对应的消费的offset的读取请求主要是得到一个对应的group在各个partition的消费的offset的记录值。
+
+case RequestKeys.OffsetFetchKey => handleOffsetFetchRequest(request)
+
+处理的是OffsetFetchRequest请求。
+def handleOffsetFetchRequest(request: RequestChannel.Request) {
+  val offsetFetchRequest = request.requestObj.asInstanceOf[OffsetFetchRequest]
+
+  // reject the request immediately if not authorized to the group
+  if (!authorize(request.session, Read,
+
+       new Resource(Group, offsetFetchRequest.groupId))) {
+
+如果session没有读取的权限时，执行的处理流程,这里生成的是一个GroupAuthorizationCode提示的错误代码响应。
+    val authorizationError = OffsetMetadataAndError(
+
+             OffsetMetadata.InvalidOffsetMetadata,
+
+             ErrorMapping.GroupAuthorizationCode)
+
+
+    val response = OffsetFetchResponse(offsetFetchRequest.requestInfo.map{ _ -> authorizationError}.toMap)
+
+
+
+
+    requestChannel.sendResponse(new Response(request,
+
+          new RequestOrResponseSend(request.connectionId, response)))
+    return
+  }
+
+
+
+
+流程执行到这里，表示session具有读取的权限，认证是否具有Describe操作的权限。
+
+根据请求的partition，按能访问与不能访问分组成两个集合。
+  val (authorizedTopicPartitions, unauthorizedTopicPartitions) =
+
+           offsetFetchRequest.requestInfo.partition { topicAndPartition =>
+    authorize(request.session, Describe,
+
+        new Resource(Topic, topicAndPartition.topic))
+  }
+
+对认证未通过的请求topic集合生成响应信息，错误代码为TopicAuthorizationCode。
+  val authorizationError = OffsetMetadataAndError(
+
+            OffsetMetadata.InvalidOffsetMetadata,
+
+            ErrorMapping.TopicAuthorizationCode)
+  val unauthorizedStatus = unauthorizedTopicPartitions.map(
+
+      topicAndPartition => (topicAndPartition, authorizationError)).toMap
+
+下面的流程部分，根据请求对应的版本号来进行不同的读取offset的流程处理，
+
+如果version的版本号是0,表示是老版本，这个时候offset的值存储在zk中，从zk中进行offset的读取，
+
+如果version的版本号是1,表示offset的存储采用的topic来进行存储，从内置的consumer_offsets的topic中进行offset的读取。
+  val response = if (offsetFetchRequest.versionId == 0) {
+
+如果流程执行到这里，表示offset是存储到的zk中，执行从zk中进行读取offset的流程，
+
+1,首先根据认证通过的请求的partition的集合进行迭代，
+
+ 从zk的路径中/consumers/groupname/offsets/topic/partition路径中读取存储的offset的值。
+
+2,这里得到的响应信息包含三种类型：
+
+2,1,类型1,如果正常读取到partition，得到的是partition对应的offset,
+
+2,2,类型2,如果没有读取到对应的partition,得到的是UnknownTopicOrPartition.
+
+2,3,类型3,如果读取出现exception,根据exception生成错误代码。
+    // version 0 reads offsets from ZK
+    val responseInfo = authorizedTopicPartitions.map( topicAndPartition => {
+      val topicDirs = new ZKGroupTopicDirs(offsetFetchRequest.groupId,
+
+            topicAndPartition.topic)
+      try {
+        if (metadataCache.getTopicMetadata(Set(topicAndPartition.topic),
+
+                   request.securityProtocol).size <= 0) {
+          (topicAndPartition, OffsetMetadataAndError.UnknownTopicOrPartition)
+        } else {
+          val payloadOpt = zkUtils.readDataMaybeNull(
+
+              topicDirs.consumerOffsetDir + "/" + topicAndPartition.partition)._1
+          payloadOpt match {
+            case Some(payload) =>
+
+               (topicAndPartition, OffsetMetadataAndError(payload.toLong))
+            case None =>
+
+               (topicAndPartition, OffsetMetadataAndError.UnknownTopicOrPartition)
+          }
+        }
+      } catch {
+        case e: Throwable =>
+          (topicAndPartition, OffsetMetadataAndError(
+
+            OffsetMetadata.InvalidOffsetMetadata,
+            ErrorMapping.codeFor(e.getClass.asInstanceOf[Class[Throwable]])))
+      }
+    })
+
+    OffsetFetchResponse(collection.immutable.Map(responseInfo: _*) ++
+
+          unauthorizedStatus, offsetFetchRequest.correlationId)
+  } else {
+
+请求group对应的offset的版本号为1时的处理流程：
+
+通过kafkaServer中生成的consumerCoordinator实例(GroupCoordinator实现)中的handleFetchOffsets函数来进行offset的加载。
+
+1,如果consumerCoordinator实例没有启动，
+
+      partition的返回信息为GroupCoordinatorNotAvailable。
+
+2,如果当前的groupid在对应的GroupMetadataManager实例中的ownedPartitions集合中不包含时，
+
+      Partition的返回信息为NotCoordinatorForGroup。
+
+3,如果当前的groupid对应的GroupMetadataManager实例中的loadingPartitions集合中包含时，
+
+     Partition表示正在执行offset的加载操作，返回的信息是GroupLoading。
+
+4,如果上面3种可能情况都不满足，表示这个group可以正常读取offste的值，通过GroupMetadataManager实例中的getOffsets函数得到对应的partition的消费的offset,如果请求只传入了group的信息，没有传入需要得到这个group中那些partition的offset,这里返回的是这个group中所有的partition的offset,否则得到指定的partition的offset的集合。
+    // version 1 reads offsets from Kafka;
+    val offsets = coordinator.handleFetchOffsets(offsetFetchRequest.groupId,
+
+         authorizedTopicPartitions).toMap
+
+    // Note that we do not need to filter the partitions in the
+    // metadata cache as the topic partitions will be filtered
+    // in coordinator's offset manager through the offset cache
+    OffsetFetchResponse(offsets ++ unauthorizedStatus,
+
+           offsetFetchRequest.correlationId)
+  }
+
+  trace("Sending offset fetch response %s for correlation id %d to client %s."
+        .format(response, offsetFetchRequest.correlationId,
+
+            offsetFetchRequest.clientId))
+
+  requestChannel.sendResponse(new RequestChannel.Response(request,
+
+        new RequestOrResponseSend(request.connectionId, response)))
+}
+
+
+处理consumer消费数据的fetch请求
+
+当一个consumer发起一个poll的请求时，会根据这个consumer中对应消费的partition来发起一个fetch请求，这个请求对应consumer要消费的所有的partition对应的broker节点发起，每个broker节点传入这个broker中partition的集合与请求的offset开始位置。
+
+case RequestKeys.FetchKey => handleFetchRequest(request)
+
+
+
+接下来看看handleFetchRequest函数的具体处理:
+
+
+def handleFetchRequest(request: RequestChannel.Request) {
+  val fetchRequest = request.requestObj.asInstanceOf[FetchRequest]
+
+得到请求的请求实例，并针对session进行Read操作的认证，并根据是否认证通过把传入的partition的集合分成两个集合，一个是认证通过的集合，一个是认证未通过的集合。
+  val (authorizedRequestInfo, unauthorizedRequestInfo) =
+
+  fetchRequest.requestInfo.partition {
+    case (topicAndPartition, _) => authorize(request.session, Read,
+
+          new Resource(Topic, topicAndPartition.topic))
+  }
+把未认证通过的集合进行迭代，这部分不参与fetch,直接生成响应结果集，
+
+响应代码为TopicAuthorizationCode。
+  val unauthorizedResponseStatus = unauthorizedRequestInfo.mapValues(_ =>
+
+FetchResponsePartitionData(ErrorMapping.TopicAuthorizationCode, -1,
+
+   MessageSet.Empty))
+
+这里生成一个用于与client端进行响应回写的callback的函数，主要是合并操作成功的fetch与操作不成功的fetch的结果集。
+  // the callback for sending a fetch response
+  def sendResponseCallback(responsePartitionData: Map[TopicAndPartition,
+
+    FetchResponsePartitionData]) {
+    val mergedResponseStatus = responsePartitionData ++ unauthorizedResponseStatus
+
+    mergedResponseStatus.foreach { case (topicAndPartition, data) =>
+      if (data.error != ErrorMapping.NoError) {
+        debug("Fetch request with correlation id %d from client %s on partition %s
+
+          failed due to %s"
+          .format(fetchRequest.correlationId, fetchRequest.clientId,
+             topicAndPartition, ErrorMapping.exceptionNameFor(data.error)))
+      }
+
+
+      // record the bytes out metrics only when the response is being sent
+      BrokerTopicStats.getBrokerTopicStats(topicAndPartition.topic)
+
+      .bytesOutRate.mark(data.messages.sizeInBytes)
+
+
+      BrokerTopicStats.getBrokerAllTopicsStats().bytesOutRate.mark(
+
+      data.messages.sizeInBytes)
+    }
+
+    def fetchResponseCallback(delayTimeMs: Int) {
+      val response = FetchResponse(fetchRequest.correlationId,
+
+         mergedResponseStatus, fetchRequest.versionId, delayTimeMs)
+
+
+      requestChannel.sendResponse(new RequestChannel.Response(request,
+
+     new FetchResponseSend(request.connectionId, response)))
+    }
+
+
+    // When this callback is triggered, the remote API call has completed
+    request.apiRemoteCompleteTimeMs = SystemTime.milliseconds
+
+    // Do not throttle replication traffic
+    if (fetchRequest.isFromFollower) {
+      fetchResponseCallback(0)
+    } else {
+      quotaManagers(RequestKeys.FetchKey).recordAndMaybeThrottle(
+
+       fetchRequest.clientId,
+           FetchResponse.responseSize(
+
+         responsePartitionData.groupBy(_._1.topic),
+
+             fetchRequest.versionId),
+           fetchResponseCallback)
+    }
+  }//end def sendResponseCallback
+
+如果认证通过的请求集合是一个空集合，直接向client端进行响应。
+  if (authorizedRequestInfo.isEmpty)
+    sendResponseCallback(Map.empty)
+  else {
+
+根据认证通过的partition的fetch请求的集合通过调用replicaManager中的fetchMessages函数来进行消息的读取。
+    // call the replica manager to fetch messages from the local replica
+    replicaManager.fetchMessages(
+      fetchRequest.maxWait.toLong,
+      fetchRequest.replicaId,
+      fetchRequest.minBytes,
+      authorizedRequestInfo,
+      sendResponseCallback)
+  }
+}
+处理group的offset的提交
+
+此请求用于处理当group对partition的数据进行消费后，指定要进行commit的offset的位置的处理。
+
+通过传入OffsetCommitRequest请求来进行处理。
+
+case RequestKeys.OffsetCommitKey => handleOffsetCommitRequest(request)
+
+
+
+下面看看这个handleOffsetCommitRequest的函数处理流程：
+
+/**
+ * Handle an offset commit request
+ */
+def handleOffsetCommitRequest(request: RequestChannel.Request) {
+  val offsetCommitRequest = request.requestObj.asInstanceOf[OffsetCommitRequest]
+
+  // reject the request immediately if not authorized to the group
+  if (!authorize(request.session, Read, new Resource(Group,
+
+           offsetCommitRequest.groupId))) {
+
+如果session没有Read的操作权限时，直接根据请求的info集合，生成每一个请求的错误代码为GroupAuthorizationCode。并直接返回，后面的流程不在进行处理。
+    val errors = offsetCommitRequest.requestInfo.mapValues(_ =>
+
+           ErrorMapping.GroupAuthorizationCode)
+    val response = OffsetCommitResponse(errors, offsetCommitRequest.correlationId)
+    requestChannel.sendResponse(new Response(request,
+
+        new RequestOrResponseSend(request.connectionId, response)))
+    return
+  }
+
+这里首先得到请求过来需要进行offset commit操作的topic中，不存在的topic信息，与存在的topic信息的请求。
+  // filter non-exist topics
+  val invalidRequestsInfo = offsetCommitRequest.requestInfo.filter {
+
+case (topicAndPartition, offsetMetadata) =>
+      !metadataCache.contains(topicAndPartition.topic)
+  }
+  val filteredRequestInfo = (offsetCommitRequest.requestInfo --
+
+  invalidRequestsInfo.keys)
+
+根据存在的topic对应的partition进行认证，得到认证通过与不通过的partition的集合。
+  val (authorizedRequestInfo, unauthorizedRequestInfo) =
+
+    filteredRequestInfo.partition {
+    case (topicAndPartition, offsetMetadata) =>
+      authorize(request.session, Read, new Resource(Topic, topicAndPartition.topic))
+  }
+
+用于向client端进行响应的消息生成与响应。
+  // the callback for sending an offset commit response
+  def sendResponseCallback(commitStatus: immutable.Map[TopicAndPartition, Short])
+
+{
+
+合并需要进行响应的所有的请求消息，如果认证不成功的，响应消息为TopicAuthorizationCode。
+    val mergedCommitStatus = commitStatus ++ unauthorizedRequestInfo.mapValues(_ =>
+
+      ErrorMapping.TopicAuthorizationCode)
+
+    mergedCommitStatus.foreach { case (topicAndPartition, errorCode) =>
+      if (errorCode != ErrorMapping.NoError) {
+        debug("Offset commit request with correlation id %d from client %s on
+
+       partition %s failed due to %s"
+          .format(offsetCommitRequest.correlationId, offsetCommitRequest.clientId,
+            topicAndPartition, ErrorMapping.exceptionNameFor(errorCode)))
+      }
+    }
+
+
+
+合并对不存在的请求的topic的消息UnknownTopicOrPartitionCode。
+    val combinedCommitStatus = mergedCommitStatus ++ invalidRequestsInfo.map(
+
+      _._1 -> ErrorMapping.UnknownTopicOrPartitionCode)
+
+
+
+向client端返回请求的响应结果。
+    val response = OffsetCommitResponse(combinedCommitStatus,
+
+       offsetCommitRequest.correlationId)
+    requestChannel.sendResponse(new RequestChannel.Response(request,
+
+     new RequestOrResponseSend(request.connectionId, response)))
+  }
+
+如果没有认证通过的消息，直接向client进行响应，响应的消息包含有未认证通过的与topic不存在的消息。
+  if (authorizedRequestInfo.isEmpty)
+    sendResponseCallback(Map.empty)
+  else if (offsetCommitRequest.versionId == 0) {
+
+这里处理请求的version的值是0的情况，这种情况offset的commit结果写入到zk的指定的路径中。
+
+如果topic存在同时请求的消息个数不超过配置的offset请求的最大大小，写入到zk中。offset请求的最大大小通过offset.metadata.max.bytes配置,默认为4096。
+
+如果请求的topic不存在，生成的响应代码为UnknownTopicOrPartitionCode。
+
+如果请求的消息超过了配置的大小生成的响应代码为OffsetMetadataTooLargeCode。
+    // for version 0 always store offsets to ZK
+    val responseInfo = authorizedRequestInfo.map {
+      case (topicAndPartition, metaAndError) => {
+        val topicDirs = new ZKGroupTopicDirs(offsetCommitRequest.groupId,
+
+             topicAndPartition.topic)
+        try {
+          if (metadataCache.getTopicMetadata(Set(topicAndPartition.topic),
+
+                  request.securityProtocol).size <= 0) {
+            (topicAndPartition, ErrorMapping.UnknownTopicOrPartitionCode)
+          } else if (metaAndError.metadata != null
+
+               && metaAndError.metadata.length > config.offsetMetadataMaxSize) {
+            (topicAndPartition, ErrorMapping.OffsetMetadataTooLargeCode)
+          } else {
+            zkUtils.updatePersistentPath(topicDirs.consumerOffsetDir + "/" +
+              topicAndPartition.partition, metaAndError.offset.toString)
+            (topicAndPartition, ErrorMapping.NoError)
+          }
+        } catch {
+          case e: Throwable => (topicAndPartition,
+
+              ErrorMapping.codeFor(e.getClass.asInstanceOf[Class[Throwable]]))
+        }
+      }
+    }
+
+    sendResponseCallback(responseInfo)
+  } else {
+
+这里的流程表示请求的offset的version的值为1,offset的提交存储到内置的topic中。
+
+得到这个offset保留的有效期，默认是24小时,可通过offsets.retention.minutes配置，可以在请求时传入保留的时长。
+    // for version 1 and beyond store offsets in offset manager
+
+    // compute the retention time based on the request version:
+    // if it is v1 or not specified by user, we can use the default retention
+    val offsetRetention =
+      if (offsetCommitRequest.versionId <= 1 ||
+        offsetCommitRequest.retentionMs == org.apache.kafka.common.requests
+
+               .OffsetCommitRequest.DEFAULT_RETENTION_TIME) {
+        coordinator.offsetConfig.offsetsRetentionMs
+      } else {
+        offsetCommitRequest.retentionMs
+      }
+
+根据配置的保留时间，或者每个partition指定的保留时间，计算出offset的过期清理的时间。
+    val currentTimestamp = SystemTime.milliseconds
+    val defaultExpireTimestamp = offsetRetention + currentTimestamp
+    val offsetData = authorizedRequestInfo.mapValues(offsetAndMetadata =>
+      offsetAndMetadata.copy(
+        commitTimestamp = currentTimestamp,
+        expireTimestamp = {
+          if (offsetAndMetadata.commitTimestamp == org.apache.kafka.common
+
+                .requests.OffsetCommitRequest.DEFAULT_TIMESTAMP)
+            defaultExpireTimestamp
+          else
+            offsetRetention + offsetAndMetadata.commitTimestamp
+        }
+      )
+    )
+
+把offset的请求写入到topic中，
+
+1,如果consumerCoordinator没有启动，
+
+     每个partition的响应代码为GROUP_COORDINATOR_NOT_AVAILABLE。
+
+2,如果consumerCoordinator对应的groupManager中的ownerPartitions中不包含对应的group,
+
+     每个partition的响应代码为NOT_COORDINATOR_FOR_GROUP。
+
+3,如果groupManager的加载还没有完成对group的加载，也就是loadingPartitions集合中还存在对应的group时，每个partition的响应代码为GROUP_LOAD_IN_PROGRESS。
+
+向topic中写入记录：
+
+1,过滤掉请求长度超过配置的offset metadata的长度的信息,
+
+2,根据请求的消息集合，生成向kafka写入的key-value对集合。
+
+3,根据offsets.topic.compression.codec配置的压缩算法，对消息进行压缩，默认不压缩
+
+4,通过replicaManager中的appendMessages函数向对应的partition中写入数据。
+
+5,把添加成功的offset的记录写入到offsetsCache集合中。
+    // call coordinator to handle commit offset
+    coordinator.handleCommitOffsets(
+      offsetCommitRequest.groupId,
+      offsetCommitRequest.memberId,
+      offsetCommitRequest.groupGenerationId,
+      offsetData,
+      sendResponseCallback)
+  }
+}

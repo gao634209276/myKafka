@@ -1,0 +1,1271 @@
+from:
+http://blog.csdn.net/u014393917/article/category/6332828
+ReplicaManager
+
+说明,此组件用于管理kafka中各partition的副本信息.,实例依赖于kafkaScheduler与logManager的实例.
+并处理对消息的添加与读取的操作.副本间数据的同步等操作。
+实例创建与启动
+实例创建
+replicaManager = new ReplicaManager(config, metrics, time, kafkaMetricsTime,
+  zkUtils, kafkaScheduler, logManager,
+  isShuttingDown)
+replicaManager.startup()
+
+首先先看看这个实例生成时,需要进行处理的流程:
+这里生成一个epoch的值,这个值用于在leader发生变化后的修改.
+
+/* epoch of the controller that last changed the leader */
+@volatile var controllerEpoch: Int = KafkaController.InitialControllerEpoch - 1
+private val localBrokerId = config.brokerId
+private val allPartitions = new Pool[(String, Int), Partition]
+private val replicaStateChangeLock = new Object
+
+这里生成一个用于同步partition副本数据线程的管理组件.
+val replicaFetcherManager = new ReplicaFetcherManager(config, this, metrics, jTime,
+       threadNamePrefix)
+private val highWatermarkCheckPointThreadStarted = new AtomicBoolean(false)
+
+这里读取每个logdir的目录下的文件replication-offset-checkpoint,这个文件中记录了每个目录下记录的partition对应的最后一个checkpoint的offset值.
+val highWatermarkCheckpoints = config.logDirs.map(dir => (
+
+new File(dir).getAbsolutePath,
+
+new OffsetCheckpoint(
+
+  new File(dir,ReplicaManager.HighWatermarkFilename))
+
+)
+
+).toMap
+private var hwThreadInitialized = false
+this.logIdent = "[Replica Manager on Broker " + localBrokerId + "]: "
+val stateChangeLogger = KafkaController.stateChangeLogger
+
+
+
+这里定义一个用于存储partition的leader改变顺序的集合.
+private val isrChangeSet: mutable.Set[TopicAndPartition] =
+
+      new mutable.HashSet[TopicAndPartition]()
+private val lastIsrChangeMs = new AtomicLong(System.currentTimeMillis())
+private val lastIsrPropagationMs = new AtomicLong(System.currentTimeMillis())
+
+这里读取配置producer.purgatory.purge.interval.requests,默认值1000,用于在procucer的ack设置是-1或者1时,跟踪消息是否添加成功,使用DelayedProduce实现.
+val delayedProducePurgatory = new DelayedOperationPurgatory[DelayedProduce](
+  purgatoryName = "Produce", config.brokerId,
+
+  config.producerPurgatoryPurgeIntervalRequests)
+
+这里读取配置fetch.purgatory.purge.interval.requests,默认值1000,
+val delayedFetchPurgatory = new DelayedOperationPurgatory[DelayedFetch](
+  purgatoryName = "Fetch", config.brokerId,
+
+  config.fetchPurgatoryPurgeIntervalRequests)
+
+
+
+
+启动ReplicaManager实例:
+
+def startup() {
+
+这里生成两个后台的调度线程,第一个用于定期检查partition对应的isr是否有心跳过期的isr,
+
+这个定期的检查周期通过replica.lag.time.max.ms配置.默认是10秒.
+
+第二个用于定期通知zk的对应路径,有partition的isr发生改变.定期发送消息的周期是2.5秒.
+  // start ISR expiration thread
+  scheduler.schedule("isr-expiration", maybeShrinkIsr,
+
+      period = config.replicaLagTimeMaxMs, unit = TimeUnit.MILLISECONDS)
+
+
+  scheduler.schedule("isr-change-propagation", maybePropagateIsrChanges,
+
+      period = 2500L, unit = TimeUnit.MILLISECONDS)
+}
+
+
+partition的leader定时副本过期检查:
+
+通过ReplicaManager启动时,定期调用maybeShrinkIsr函数来进行处理,
+
+当follower的副本向leader的副本进行数据同步操作时，如果副本已经读取到leader的log的最后的offset部分时，表示这个副本同步达到最新的副本状态，会更新每一个副本的心跳时间，这个函数定期检查这个心跳时间是否超过了配置的时间，如果超过了，就会移出这个副本在isr上的选择。
+
+private def maybeShrinkIsr(): Unit = {
+  trace("Evaluating ISR list of partitions to see which replicas can be removed from
+
+          the ISR")
+
+直接迭代当前的broker中所有的分配的partition的集合,并调用partition内部的处理函数.
+
+在ReplicaManager中的allPartitions集合存储有当前broker中所有的partition.
+  allPartitions.values.foreach(partition =>
+
+      partition.maybeShrinkIsr(config.replicaLagTimeMaxMs))
+}
+
+
+
+接下来看看Partition中处理isr的过期检查流程:
+
+def maybeShrinkIsr(replicaMaxLagTimeMs: Long) {
+  val leaderHWIncremented = inWriteLock(leaderIsrUpdateLock) {
+
+这里首先检查当前的partition的loader是否是当前的broker,如果不是,这个地方得到的值是false,
+
+否则执行leaderReplica的处理部分
+    leaderReplicaIfLocal() match {
+      case Some(leaderReplica) =>
+
+当前的partition在当前的机器上是leader时,检查这个partition的所有的副本中,是否有过期的副本,也就是超过了指定的时间没有更新心跳的副本,得到这个过期的副本集合.
+        val outOfSyncReplicas = getOutOfSyncReplicas(leaderReplica,
+
+              replicaMaxLagTimeMs)
+        if(outOfSyncReplicas.size > 0) {
+
+这里表示当前的partition中有副本过期,得到新的未过期的副本.
+          val newInSyncReplicas = inSyncReplicas -- outOfSyncReplicas
+          assert(newInSyncReplicas.size > 0)
+          info("Shrinking ISR for partition [%s,%d] from %s to %s".format(topic,
+
+             partitionId,
+             inSyncReplicas.map(_.brokerId).mkString(","),
+
+             newInSyncReplicas.map(_.brokerId).mkString(",")))
+
+updateIsr函数用于对副本改变后的isr的更新,具体流程:
+
+1,在zk中/brokers/topics/topicname/partitions/paritionid/state路径下更新最新的isr记录.
+
+2,在ReplicaManager中的isrChangeSet集合中添加副本变化的TopicAndPartition,标记下这个partition的isr被修改.
+
+3,更新inSyncReplicas集合为新的副本集合.
+          // update ISR in zk and in cache
+          updateIsr(newInSyncReplicas)
+          // we may need to increment high watermark since ISR could be down to 1
+
+          replicaManager.isrShrinkRate.mark()
+
+这里根据当前leaderReplica的副本的highWatermark与当前的partition中最大的offsetMeta进行比较,如果leader对应的最高的消息的offset小于当前partition中最大的offsetMeta对应的offset,或者当前leader对应highWatermark的segment的baseoffset小于partition中最大的offset对应的segment的baseoffset时,这个函数返回true,否则返回false.
+          maybeIncrementLeaderHW(leaderReplica)
+        } else {
+          false
+        }
+
+      case None => false // do nothing if no longer leader
+    }
+  }
+
+如果上面的处理得到的返回值是true,表示isr有发生过变化,尝试执行当前的副本中针对此partition当前挂起的任务.
+
+挂起的任务处理包含有fetch与produce的操作.
+  // some delayed operations may be unblocked after HW changed
+  if (leaderHWIncremented)
+    tryCompleteDelayedRequests()
+}
+
+
+把isr的改变更新到zk中
+
+这个由一个定时器每2500ms执行一次maybePropagateIsrChanges函数。
+
+这个函数在定时执行的maybeShrinkIsr函数中如果发现有副本没有心跳更新时，会执行partition的updateIsr的操作，这个操作会把isr发生过变化的partition记录到isrChangeSet集合中.
+
+这个函数在有partition的副本心跳超时后，把isr的变化对应的partition更新到zk中的/isr_change_notification/isr_change_节点中。
+
+更新条件，isrChangeSet集合不为空，最后一次有副本超时的更新已经超过了5秒或者上一次更新到zk中超时的变化信息已经超过了60秒，
+
+ */
+def maybePropagateIsrChanges() {
+  val now = System.currentTimeMillis()
+  isrChangeSet synchronized {
+    if (isrChangeSet.nonEmpty &&
+      (lastIsrChangeMs.get()
+
+          + ReplicaManager.IsrChangePropagationBlackOut < now ||
+               lastIsrPropagationMs.get()
+
+               + ReplicaManager.IsrChangePropagationInterval < now)
+
+      )
+
+    {
+      ReplicationUtils.propagateIsrChanges(zkUtils, isrChangeSet)
+      isrChangeSet.clear()
+      lastIsrPropagationMs.set(now)
+    }
+  }
+}
+
+
+副本的leader的切换处理
+
+这个部分在kafka leader的节点处理对partition的leader的变化后，会向对应的broker节点发起一个LeaderAndIsr的请求，这个请求主要用于处理副本变成leader或者从leader变化成follower时需要执行的操作。这个分析在KafkaApis中的处理partition的LeaderAndIsr的请求部分进行了分析，这里不做明细的说明，说明下主要流程：
+
+如果副本从follower切换成了leader节点，那么这个副本中用于同步数据的线程会被停止，同时修改partition对应的leaderId为partition的leader节点对应的brokerId.
+
+如果副本从leader切换成follower时，在这个节点的数据同步线程中加入这个partition的同步,设置这个partition对应的leaderId的值为当前的leader节点的id.
+处理消息追加
+
+首先行看看这个函数的定义部分,最后的responseCallback是一个函数,这个函数由调用方来进行实现,主要是对消息添加后的状态的处理,如Produce的请求时,会根据这个响应的消息加上认证失败的消息判断是否需要向client端发送失败的数据回去.第三个参数表示是否是内部操作,如果是Produce时,这个参数为false(clientId不是__admin_client).当一个produce向对应的partition写入消息或者针对consumer（使用的topic来记录group与offset信息时）的syncGroup与commitOffset时，会执行这个操作。
+
+
+appendMessages函数
+
+在produce向broker写入数据时，会通过replicaManager中的appendMessages来进行消息的添加操作。这个函数的最后一个参数是一个回调函数，也就是上面处理produce请求中定义的函数，用于根据ack的操作，向client端回写操作的情况。
+
+
+def appendMessages(timeout: Long,
+                   requiredAcks: Short,
+                   internalTopicsAllowed: Boolean,
+                   messagesPerPartition: Map[TopicAndPartition, MessageSet],
+        responseCallback: Map[TopicAndPartition, ProducerResponseStatus] => Unit) {
+
+  if (isValidRequiredAcks(requiredAcks)) {
+
+如果ack的值是一个正确的值时，通过appendToLocalLog函数，向log中写入对应的partition的消息,并得到写入后的状态值。
+    val sTime = SystemTime.milliseconds
+    val localProduceResults = appendToLocalLog(internalTopicsAllowed,
+
+            messagesPerPartition, requiredAcks)
+    debug("Produce to local log in %d ms".format(SystemTime.milliseconds - sTime))
+
+这里生成produce的写入消息的状态，记录每个partition中写入后的错误代码，开始的offset与结束的offset的值。
+    val produceStatus = localProduceResults.map {
+
+       case (topicAndPartition, result) =>
+          topicAndPartition ->
+              ProducePartitionStatus(
+                result.info.lastOffset + 1, // required offset
+                ProducerResponseStatus(result.errorCode, result.info.firstOffset))
+    }
+
+    if (delayedRequestRequired(requiredAcks, messagesPerPartition,
+
+              localProduceResults)) {
+
+这种情况下，ack的值是默认的-1,同时向对应的partition的log中写入消息失败的个数小于请求的消息的partition的个数，表示这里面有成功写入到log的消息，根据produce的ack的超时时间，与每个partition的写入消息的状态，等待延时处理并发送结果给client端。
+      // create delayed produce operation
+      val produceMetadata = ProduceMetadata(requiredAcks, produceStatus)
+      val delayedProduce = new DelayedProduce(timeout, produceMetadata, this,
+
+             responseCallback)
+
+      val producerRequestKeys = messagesPerPartition.keys.map(
+
+              new TopicPartitionOperationKey(_)).toSeq
+
+
+
+这里最长等待达到ack的超时时间的等待，如果都还没有得到ack的响应，向client端返回的消息就是对应的错误代码，
+
+处理流程，迭代操作请求消息的所有的partition的状态：
+
+1,如果当前的broker中找不到对应的partition的结果，错误代码UnknownTopicOrPartitionCode。
+
+2,如果partition对应的副本个数小于配置的最少副本个数的值，
+
+               错误代码NotEnoughReplicasAfterAppendCode。
+
+3,如果partition的副本在当前的broker中不是leader的副本，
+
+               错误代码NotLeaderForPartitionCode。
+
+4,正常完成添加消息的操作，错误代码NoError。
+
+5,如果在指定的超时时间内，还没有完成所有的操作，错误代码RequestTimedOutCode。
+      delayedProducePurgatory.tryCompleteElseWatch(delayedProduce,
+
+               producerRequestKeys)
+
+    } else {
+
+这种情况下，表示ack不是-1,或者说当前的写入全部出错，直接向client端响应。
+
+在client端的produce中，建议把ack的值设置成1,这样能保证数据最少写入到了leader中，同时又能快速的向client端进行响应。
+      // we can respond immediately
+      val produceResponseStatus = produceStatus.mapValues(status =>
+
+              status.responseStatus)
+      responseCallback(produceResponseStatus)
+    }
+  } else {
+
+如果流程执行到这里时，表示消息没有被成功添加，因为ack的值认证不合法，向client端响应的错误代码是INVALID_REQUIRED_ACKS。
+    val responseStatus = messagesPerPartition.map {
+      case (topicAndPartition, messageSet) =>
+        (topicAndPartition ->
+                ProducerResponseStatus(Errors.INVALID_REQUIRED_ACKS.code,
+                  LogAppendInfo.UnknownLogAppendInfo.firstOffset))
+    }
+
+
+    responseCallback(responseStatus)
+  }
+}
+
+
+appendToLocalLog函数的执行流程：
+
+这里把produce端请求过来的针对每个partition的消息，把这些消息添加到对应的partition的log中。
+private def appendToLocalLog(internalTopicsAllowed: Boolean,
+                   messagesPerPartition: Map[TopicAndPartition, MessageSet],
+            requiredAcks: Short): Map[TopicAndPartition, LogAppendResult] = {
+  trace("Append [%s] to local log ".format(messagesPerPartition))
+
+对请求的消息进行迭代，每次迭代可以得到一个partition与这个partition对应的请求需要写入消息集合。
+  messagesPerPartition.map {
+
+case (topicAndPartition, messages) =>
+      BrokerTopicStats.getBrokerTopicStats(
+
+         topicAndPartition.topic).totalProduceRequestRate.mark()
+      BrokerTopicStats.getBrokerAllTopicsStats().totalProduceRequestRate.mark()
+
+如果要添加的消息是__consumer_offsets topic的内容时，同时这个client端不是admin的client端，提示这个消息不能被添加。
+    // reject appending to internal topics if it is not allowed
+    if (Topic.InternalTopics.contains(topicAndPartition.topic)
+
+                   && !internalTopicsAllowed) {
+      (topicAndPartition, LogAppendResult(
+        LogAppendInfo.UnknownLogAppendInfo,
+        Some(new InvalidTopicException(
+
+    "Cannot append to internal topic %s"
+
+    .format(topicAndPartition.topic)))))
+    } else {
+
+这里表示当前的client可以对这个topic进行消息的添加操作。
+
+在针对每个partition的处理中，如果处理成功添加到Log中会响应回去的信息包含一个info,
+
+如果处理消息的添加出错时，响应的info是一个UnknownLogAppendInfo实例与异常。
+      try {
+
+得到要添加消息的partition的实例，并向这个实例的leader的副本中添加消息到log中。
+
+如果当前的broker中没有找到对应的partition时，这个会生成一个exception.
+
+向partition的log中添加消息的流程：
+
+1,检查当前的broker中对应此partition的副本是否是leader,如果不是，
+
+              exception为NotLeaderForPartitionException。
+
+2,当前的broker是partition的leader,得到这个副本对应的Log实例，并得到最小需要的副本个数。
+
+3,如果ack的值是-1,同时这个配置的最小副本个数大于isr的副本集合过数，
+
+              生成exception为NotEnoughReplicasException。
+
+4,通过log实例的append函数向segment中添加消息,
+
+4,1,得到当前的next的offset当前要添加的消息集合的firstOffset的值。
+
+4,2,得到当前log中活动的segment的实例，如果当前的消息加上当前segment已经存在的消息超过了每一个segment配置的大小或者说这个segment已经超过了需要重新生成segment最长活动时间或者当前的segment的index已经达到了最大的个数时，结束当前的segment,并重新生成segment,否则直接得到当前的segment的实例。
+
+4,3,向当前的活动的segment中写入log日志与index信息，并得到appendInfo的lestOffset的值。
+
+4,4,更新当前partition的offsetMetadata的值为当前的lastOffset的值加1.
+
+4,5在向partition写入数据后，会计算当前partition的highWatermark值，这个值取isr的同步副本集合列表中副本对应的endoffset最小的值，这个highWatermark的值表示这个partition的committed的offset的值。
+        val partitionOpt = getPartition(topicAndPartition.topic,
+
+                   topicAndPartition.partition)
+        val info = partitionOpt match {
+          case Some(partition) =>
+            partition.appendMessagesToLeader(
+
+                messages.asInstanceOf[ByteBufferMessageSet],
+
+                 requiredAcks)
+          case None => throw new UnknownTopicOrPartitionException(
+
+            "Partition %s doesn't exist on %d"
+            .format(topicAndPartition, localBrokerId))
+        }
+得到向partition中添加的记录的条数。
+        val numAppendedMessages =
+          if (info.firstOffset == -1L || info.lastOffset == -1L)
+            0
+          else
+            info.lastOffset - info.firstOffset + 1
+
+
+
+这里生成每个topic的统计信息。
+        BrokerTopicStats.getBrokerTopicStats(topicAndPartition.topic)
+
+              .bytesInRate.mark(messages.sizeInBytes)
+        BrokerTopicStats.getBrokerAllTopicsStats
+
+              .bytesInRate.mark(messages.sizeInBytes)
+        BrokerTopicStats.getBrokerTopicStats(topicAndPartition.topic)
+
+              .messagesInRate.mark(numAppendedMessages)
+        BrokerTopicStats.getBrokerAllTopicsStats.messagesInRate.mark(
+
+              numAppendedMessages)
+
+        trace(日志)
+
+
+        (topicAndPartition, LogAppendResult(info))
+      } catch {
+        case e: KafkaStorageException =>
+          fatal(错误日志,这里会直接结束掉当前的broker进程)
+          Runtime.getRuntime.halt(1)
+          (topicAndPartition, null)
+
+
+
+下面的情况，根据向partition中写入log信息出现的错误，生成不同的响应结果,这个用于判断向某个partition中写入消息失败的具体错误 。
+        case utpe: UnknownTopicOrPartitionException =>
+          (topicAndPartition,
+
+             LogAppendResult(LogAppendInfo.UnknownLogAppendInfo, Some(utpe)))
+        case nle: NotLeaderForPartitionException =>
+          (topicAndPartition,
+
+             LogAppendResult(LogAppendInfo.UnknownLogAppendInfo, Some(nle)))
+        case mtle: MessageSizeTooLargeException =>
+          (topicAndPartition,
+
+             LogAppendResult(LogAppendInfo.UnknownLogAppendInfo, Some(mtle)))
+        case mstle: MessageSetSizeTooLargeException =>
+          (topicAndPartition,
+
+             LogAppendResult(LogAppendInfo.UnknownLogAppendInfo, Some(mstle)))
+        case imse : InvalidMessageSizeException =>
+          (topicAndPartition,
+
+             LogAppendResult(LogAppendInfo.UnknownLogAppendInfo, Some(imse)))
+        case t: Throwable =>
+          BrokerTopicStats.getBrokerTopicStats(topicAndPartition.topic)
+
+               .failedProduceRequestRate.mark()
+          BrokerTopicStats.getBrokerAllTopicsStats.failedProduceRequestRate.mark()
+          error(这里打印非处理的异常)
+          (topicAndPartition,
+
+             LogAppendResult(LogAppendInfo.UnknownLogAppendInfo, Some(t)))
+
+
+      }//end case by partition
+    }
+  }//end partitions messages的迭代处理
+}
+
+
+处理消息的读取
+
+当一个consumer发起一个poll的请求时，会异步的执行这个consumer中所有的partition数据消费的fetch的请求操作，这个操作通过KafkaApis中对应的请求来调用ReplicaManager中的fetchMessages的函数来进行处理。
+fetchMessages的入口函数
+
+这个函数在kafkaApis中根据请求的parition集合，直接调用了ReplicaManager中的fetchMessages的函数，接下来这部分主要看看这个函数的执行逻辑。
+
+先根据函数的定义来进行说明，这个函数中最后一个responseCallback是一个用于向请求的client端回写fetch的响应结果的回调函数。
+
+fetchInfo参数是需要进行fetch操作的partition与开始的offset的信息。
+def fetchMessages(timeout: Long,
+ replicaId: Int,
+ fetchMinBytes: Int,
+ fetchInfo: immutable.Map[TopicAndPartition, PartitionFetchInfo],
+ responseCallback: Map[TopicAndPartition, FetchResponsePartitionData] => Unit) {
+
+
+
+首先判断下进行fetch操作的副本节点的id，如果replicaId是一个大于或等于0的值，表示这个请求是一个从当前的partition的follower节点发起的副本复制请求。
+
+如果是-1或者-2时，表示这是一个由consumer发起的请求。
+  val isFromFollower = replicaId >= 0
+
+
+
+检查replicaId是否是DebuggingConsumerId（-2）对应的值，如果是consumer的请求，这个值默认是-1,也就是说当是一个副本复制的请求或者是consumer默认的请求过来时，这个地方生成出来的变量是一个true值。
+  val fetchOnlyFromLeader: Boolean = replicaId != Request.DebuggingConsumerId
+
+
+
+这里得到的fetchOnlyCommitted的值如果是true表示这是一个consumer的请求，读取数据时不一定得到到的最后的offset是log的endoffset而是这个partition中所有的副本中最小的一个endoffset的值。
+  val fetchOnlyCommitted: Boolean = ! Request.isValidBrokerId(replicaId)
+
+从Log中加载对应的offset的消息记录到buffer中。
+  // read from local logs
+  val logReadResults = readFromLocalLog(fetchOnlyFromLeader, fetchOnlyCommitted,
+
+       fetchInfo)
+
+这里根据读取消息的结果集信息，同时如果请求的replicaId的值是对应这个partition的follower的副本节点时，这里检查这个副本对应的offset是否已经达到了当前的leader的offset的值，如果已经达到，表示这个副本已经是最新的值，检查这个副本对应的broker是否在isr的副本集合中，如果不在，把这个副本添加到isr的副本复制集合中，同时更新zk中对应此partition的isr的集合信息。
+
+如果是consumer来消费数据时，这个流程不会判断。
+
+更新这个副本同步到的最新的一条offset的metadata信息，把同步到的最新的这条消息的offsetmetadata存储为这个副本对应的logEndOffset。
+  // if the fetch comes from the follower,
+  // update its corresponding log end offset
+  if(Request.isValidBrokerId(replicaId))
+    updateFollowerLogReadResults(replicaId, logReadResults)
+
+  // check if this fetch request can be satisfied right away
+  val bytesReadable = logReadResults.values.map(
+
+          _.info.messageSet.sizeInBytes).sum
+
+
+
+这里得到响应的所有的partition的集合中读取消息的响应代码不是NoError的代码的集合，这个地方的调用返回的是一个true/flase的值，如果是true表示响应的partition中包含有错误的partition的消息读取，否则表示读取消息完全正确。
+  val errorReadingData = logReadResults.values.foldLeft(false) (
+
+(errorIncurred, readResult) =>
+       errorIncurred || (readResult.errorCode != ErrorMapping.NoError)
+
+  )
+
+如果当前的请求没有设置超时时间或者请求的partition的集合为空，或者说这次请求有足够的数据进行响应，或者有读取消息错误时，直接向请求的client端响应读取的结果。
+  if(timeout <= 0 || fetchInfo.size <= 0 || bytesReadable >= fetchMinBytes ||
+
+           errorReadingData) {
+    val fetchPartitionData = logReadResults.mapValues(result =>
+      FetchResponsePartitionData(result.errorCode, result.hw,
+
+           result.info.messageSet))
+    responseCallback(fetchPartitionData)
+  } else {
+
+这种情况下表示当前的消息读取没有读取到指定的最小的byte字节数，同时消息读取也没有发生对应的错误处理的处理情况,生成用于延时处理的DelayedFetch实例，并根据处理的每一个partition生成key,执行延时的响应处理。
+    // construct the fetch results from the read results
+    val fetchPartitionStatus = logReadResults.map {
+
+      case (topicAndPartition, result) =>
+        (topicAndPartition, FetchPartitionStatus(result.info.fetchOffsetMetadata,
+
+           fetchInfo.get(topicAndPartition).get))
+    }
+    val fetchMetadata = FetchMetadata(fetchMinBytes, fetchOnlyFromLeader,
+
+             fetchOnlyCommitted, isFromFollower, fetchPartitionStatus)
+    val delayedFetch = new DelayedFetch(timeout, fetchMetadata, this,
+
+         responseCallback)
+
+
+    val delayedFetchKeys = fetchPartitionStatus.keys.map(
+
+          new TopicPartitionOperationKey(_)).toSeq
+
+    delayedFetchPurgatory.tryCompleteElseWatch(delayedFetch, delayedFetchKeys)
+  }
+}
+
+
+从LogManager组件中加载fetch请求的数据集
+
+在执行fetchMessages的操作时，根据请求对应的partition与offset的信息，通过ReplicaManager组件中的readFromLocalLog函数会迭代向对应的partition的Log执行消息的加载处理，这个过程通过LogManager进行处理。
+
+
+
+首先先看看ReplicaManager中readFromLocalLog函数:
+
+这个函数中传入的参数，第一个表示是否只读取leader的副本的数据，非debug时这个值为true,
+
+第二个参数表示是否只读取committed完成的数据，committed的数据是只有副本同步成功后的offset的记录才叫committed的数据。
+def readFromLocalLog(fetchOnlyFromLeader: Boolean,
+                     readOnlyCommitted: Boolean,
+                     readPartitionInfo: Map[TopicAndPartition, PartitionFetchInfo]): Map[TopicAndPartition, LogReadResult] = {
+
+对请求的要fetch的partition的集合进行迭代处理。这个迭代返回的一个map的key是partition,value是读取到的消息或者说对应的错误信息。
+  readPartitionInfo.map { case (TopicAndPartition(topic, partition),
+
+                PartitionFetchInfo(offset, fetchSize)) =>
+    BrokerTopicStats.getBrokerTopicStats(topic).totalFetchRequestRate.mark()
+    BrokerTopicStats.getBrokerAllTopicsStats().totalFetchRequestRate.mark()
+
+    val partitionDataAndOffsetInfo =
+      try {
+        trace("Fetching log segment for topic %s, partition %d, offset %d,
+
+              size %d".format(topic, partition, offset, fetchSize))
+
+根据fetch是否只能读取partition的leader的副本的数据来得到副本，如果只能读取leader上的数据，那么这里检查当前broker中对应的这个副本是否是leader的副本，
+
+如果不是会生成NotLeaderForPartitionException的exception.
+
+如果fetch的传入的fetchOnlyFromLeader的值false,表示这是一个debug的模式，得到这个partition在当前节点上的副本，如果当前broker没有对应这个partition的副本时，
+
+生成一个ReplicaNotAvailableException的exception.
+        val localReplica = if (fetchOnlyFromLeader)
+          getLeaderReplicaIfLocal(topic, partition)
+        else
+          getReplicaOrException(topic, partition)
+
+
+
+如果传入的参数说明只能读取当前partition对应的所有副本中最小的offset的值，得到这个commited的offset,也就是highWatermark的offset的值(所有副本中同步到的最小的offset),否则这个值为None,如果是None时，表示可以读取到当前的副本中最后一条记录。在非consumer的fetch请求时，这个值为None
+        val maxOffsetOpt = if (readOnlyCommitted)
+          Some(localReplica.highWatermark.messageOffset)
+        else
+          None
+
+这里得到当前的副本中最后一条记录的offset的标记值,通过得到这个副本对应的Log实例，并执行其read函数来读取指定大小的数据。
+        val initialLogEndOffset = localReplica.logEndOffset
+        val logReadInfo = localReplica.log match {
+          case Some(log) =>
+            log.read(offset, fetchSize, maxOffsetOpt)
+          case None =>
+            error("Leader for partition [%s,%d] does not have a local log"
+
+                .format(topic, partition))
+
+
+            FetchDataInfo(LogOffsetMetadata.UnknownOffsetMetadata,
+
+                 MessageSet.Empty)
+        }
+
+这里根据当前的副本中最后一条记录的offset减去读取到的消息的offset,如果这个值小于或等于0,表示这次读取达到了当前log中的最后一条消息。
+        val readToEndOfLog = initialLogEndOffset.messageOffset -
+
+             logReadInfo.fetchOffsetMetadata.messageOffset <= 0
+根据读取到的消息，当前partition中committed的offset，读取大小，是否已经读取到最后一条消息生成一个LogReadResult的实例，这个实例最后的一个参数表示是否有错误的错误实例。
+        LogReadResult(logReadInfo, localReplica.highWatermark.messageOffset,
+
+             fetchSize, readToEndOfLog, None)
+      } catch {
+        case utpe: UnknownTopicOrPartitionException =>
+          LogReadResult(FetchDataInfo(LogOffsetMetadata.UnknownOffsetMetadata,
+
+              MessageSet.Empty), -1L, fetchSize, false, Some(utpe))
+
+
+        case nle: NotLeaderForPartitionException =>
+          LogReadResult(FetchDataInfo(LogOffsetMetadata.UnknownOffsetMetadata,
+
+              MessageSet.Empty), -1L, fetchSize, false, Some(nle))
+
+
+        case rnae: ReplicaNotAvailableException =>
+          LogReadResult(FetchDataInfo(LogOffsetMetadata.UnknownOffsetMetadata,
+
+              MessageSet.Empty), -1L, fetchSize, false, Some(rnae))
+
+
+        case oor : OffsetOutOfRangeException =>
+          LogReadResult(FetchDataInfo(LogOffsetMetadata.UnknownOffsetMetadata,
+
+              MessageSet.Empty), -1L, fetchSize, false, Some(oor))
+
+
+        case e: Throwable =>
+          BrokerTopicStats.getBrokerTopicStats(topic)
+
+               .failedFetchRequestRate.mark()
+          BrokerTopicStats.getBrokerAllTopicsStats()
+
+               .failedFetchRequestRate.mark()
+
+
+          error("Error processing fetch operation on partition [%s,%d] offset
+
+                %d".format(topic, partition, offset), e)
+
+
+          LogReadResult(FetchDataInfo(LogOffsetMetadata.UnknownOffsetMetadata,
+
+              MessageSet.Empty), -1L, fetchSize, false, Some(e))
+      }
+    (TopicAndPartition(topic, partition), partitionDataAndOffsetInfo)
+  }
+}
+
+
+
+接下来看看Log的read函数，如何处理对某一个partition数据的fetch:
+
+
+def read(startOffset: Long, maxLength: Int, maxOffset: Option[Long] = None)
+
+: FetchDataInfo = {
+  trace("Reading %d bytes from offset %d in log %s of length %d bytes"
+
+         .format(maxLength, startOffset, name, size))
+
+得到当前的partition中当前的副本log中最后一个被append进去的offset的metadata信息，这个offset是下一个消息进行来时的offset.
+  val currentNextOffsetMetadata = nextOffsetMetadata
+  val next = currentNextOffsetMetadata.messageOffset
+
+
+
+如果请求传入的开始的offset的值已经与当前最后一条消息添加后得到的offset值相同，表示partitoin中没有最新的日志,这个时候，直接返回一个空的消息读取集合。
+  if(startOffset == next)
+    return FetchDataInfo(currentNextOffsetMetadata, MessageSet.Empty)
+
+从segments的集合中根据当前的开始的offset得到对应的segment中baseOffset等于或小于这个值的segment.
+  var entry = segments.floorEntry(startOffset)
+
+如果startOffset大于了最大的offset或者通过startOffset没有得到对应的segment时，直接结束这个读取流程，并throw一个OffsetOutOfRangeException异常。
+  // attempt to read beyond the log end offset is an error
+  if(startOffset > next || entry == null)
+    throw new OffsetOutOfRangeException("Request for offset %d but we only have log
+
+          segments in the range %d to %d."
+
+          .format(startOffset, segments.firstKey, next))
+
+  while(entry != null) {
+
+这里根据当前的segment是否是最后一个segment(最后一个是活动的segment),如果是，得到当前segment中写入到的消息的最后一个position的位置（下一条记录append的开始位置）,如果不是最后一个segment时，得到这个segment的size大小。
+    val maxPosition = {
+      if (entry == segments.lastEntry) {
+        val exposedPos = nextOffsetMetadata.relativePositionInSegment.toLong
+
+
+        if (entry != segments.lastEntry)
+          entry.getValue.size
+        else
+          exposedPos
+      } else {
+        entry.getValue.size
+      }
+    }
+
+通过对应的Segment的read函数，从指定的开始offset开始读取，允许读取的maxOffset这个值根据是否是consumer的fetch来控制，如果是consumer时，这是所有的副本中最小的一个endOffset,否则是leader副本中的endOffset,maxPosition是这个segment最后的position的位置。
+    val fetchInfo = entry.getValue.read(startOffset, maxOffset, maxLength,
+
+              maxPosition)
+
+
+
+如果从segment中读取返回的是一个null值，表示这个offset在log中不存在消息，从这个segment开始向后查找下一个segment，并重复执行上面的操作，直到读取到最后一个segment为结束。
+    if(fetchInfo == null) {
+      entry = segments.higherEntry(entry.getKey)
+    } else {
+      return fetchInfo
+    }
+  }
+
+
+这种情况下，表示对segment从开始位置对应的segment向后找到所有的segment后，没有找到对应的数据，直接返回一个空的消息集合。
+  FetchDataInfo(nextOffsetMetadata, MessageSet.Empty)
+}
+
+
+
+读取Log中某一个Segment指定大小的消息：
+
+这个在读取Log中的消息时会根据开始的offset找到对应的segment开始消息的读取，通过调用LogSegment中的read函数来进行处理，
+
+这个函数中，第一个参数是开始的offset的位置，第二个参数是读取的最大可能的offset的值，如果是consumer过来时，这个值是highWatermark的值，否则是当前的副本的endOffset.
+
+第三个参数maxSize表示读取的最大byte字节数。
+
+第四个参数是这个segment中最后的position的位置。
+
+def read(startOffset: Long, maxOffset: Option[Long], maxSize: Int,
+
+         maxPosition: Long = size): FetchDataInfo = {
+  if(maxSize < 0)
+    throw new IllegalArgumentException("Invalid max size for log read (%d)"
+
+          .format(maxSize))
+
+根据开始执行数据读取的offset找到这个offset对应log中segment的position,流程：
+
+1,先根据startOffset从index中找到这个offset对应的索引的存储信息，找到索引中小于或等于这个信息的索引的offset的存储位置，
+
+2,根据这个offset对应的索引的position开始值，从这个segment中这个position开始读取，直到读取数据并比对读取到数据的offset是否大于或等于这个startOffset,如果是，返回这个offset的position,否则返回null,表示没有读取到这个startOffset的offset或者更大的offset。
+  val logSize = log.sizeInBytes // this may change, need to save a consistent copy
+  val startPosition = translateOffset(startOffset)
+
+如果在segment对应的日志文件中没有找到开始查询的offset或者更大的offet,直接返回一个nulL值，表示需要执行下一个segment的查找。
+  // if the start position is already off the end of the log, return null
+  if(startPosition == null)
+    return null
+
+生成一个开始执行查找操作的metadata
+  val offsetMetadata = new LogOffsetMetadata(startOffset, this.baseOffset,
+
+       startPosition.position)
+
+如果要查找的大小为0,表示没有必要进行查询，直接返回一个空的消息集合。
+  // if the size is zero, still return a log segment but with zero size
+  if(maxSize == 0)
+    return FetchDataInfo(offsetMetadata, MessageSet.Empty)
+
+
+
+这里根据要执行的最大的offset的值，计算出要读取的数据长度，
+
+1,如果maxOffset的值不是None时，根据这个offset（必须大于startOffset）从segment中计算出这个fofset对应的位置，如果在segment中找到了maxOffset对应的位置或者文件最后的位置，根据这个位置与这次要进行读取的最大的byte字节数，取最小值来计算出要读取的长度，也就是说如果当前的文件还剩下的长度小于要读取的字节数，取剩余的长度，否则按读取的字节数来当要读取的长度。
+
+2,如果maxOffset的值是None时，这里的计算相对简单，直接根据文件的最后位置减去开始读取的位置得到一个长度与要读取的最大的长度取最小值。
+  val length =
+    maxOffset match {
+      case None =>
+        // no max offset, just read until the max position
+        min((maxPosition - startPosition.position).toInt, maxSize)
+      case Some(offset) => {
+        if(offset < startOffset)
+          throw new IllegalArgumentException("Attempt to read with a maximum offset
+
+              (%d) less than the start offset (%d).".format(offset, startOffset))
+
+
+        val mapping = translateOffset(offset, startPosition.position)
+        val endPosition =
+          if(mapping == null)
+            logSize
+          else
+            mapping.position
+
+
+        min(min(maxPosition, endPosition) - startPosition.position, maxSize).toInt
+      }
+    }
+
+最后，根据计算出来的开始位置与要读取的长度，从日志文件中读取消息并存储到一个buffer中。
+  FetchDataInfo(offsetMetadata, log.read(startPosition.position, length))
+}
+延时处理fetch的请求响应
+
+当一个fetch的请求处理时，如果对应的partition集合有部分fetch出现错误时，会生成一个步处理的操作，DelayedFetch，并通过delayedFetchPurgatory来进行处理。
+
+1,先看看第一步完成请求或者放入监听的操作,：
+
+1,1,首先执行DelayedFetch中的tryComplete函数来检查是否执行完成。
+
+ */
+override def tryComplete() : Boolean = {
+  var accumulatedSize = 0
+
+
+
+迭代每一个partition的处理结果的状态集，
+  fetchMetadata.fetchPartitionStatus.foreach {
+    case (topicAndPartition, fetchStatus) =>
+      val fetchOffset = fetchStatus.startOffsetMetadata
+      try {
+        if (fetchOffset != LogOffsetMetadata.UnknownOffsetMetadata) {
+
+如果处理这个partition时，得到的处理结果不是一个UnknownOffsetMetadata实例时，得到当前的broker中的副本，这个副本必须是leader的副本。
+          val replica = replicaManager.getLeaderReplicaIfLocal(
+
+               topicAndPartition.topic, topicAndPartition.partition)
+
+得到用于进行读取时，最大可能读取到的最后的一个offset值。
+          val endOffset =
+            if (fetchMetadata.fetchOnlyCommitted)
+              replica.highWatermark
+            else
+              replica.logEndOffset
+如果针对这一个partition开始读取的offset的值与当前可以用于读取的endOffset的值不相同，表示当前的partition中有可以读取的数据,或者endOffset小于beginOffset.
+          if (endOffset.messageOffset != fetchOffset.messageOffset) {
+
+如果当前最后一个可以读取的endOffset对应的segment的baseOffset的值小于fetchOffset对应的segment的baseOffset的值，表示当前要开始查询的位置可能在当前endOffset对应的segment中。
+            if (endOffset.onOlderSegment(fetchOffset)) {
+              debug("Satisfying fetch %s since it is fetching later segments of
+
+                  partition %s.".format(fetchMetadata, topicAndPartition))
+
+
+
+执行完成操作，这里会调用onComplete函数
+              return forceComplete()
+            } else if (fetchOffset.onOlderSegment(endOffset)) {
+
+如果当前开始要读取的fetchOffset对应的segment的baseOffset小于endOffset对应的segment的开始位置，表示这个开始位置对应的segment是endOffset对应的segment的前面的segment,
+
+
+
+执行完成操作，这里会调用onComplete函数
+              debug("Satisfying fetch %s immediately since it is fetching older
+
+                      segments.".format(fetchMetadata))
+              return forceComplete()
+            } else if (fetchOffset.messageOffset < endOffset.messageOffset) {
+
+这种情况，表示当前读取的消息正常，读取的offset小于当前endOffset中对应的这个messageOffset的值(最后一个可以读取到的offset)。累加出共读取到的数据的字节大小。
+              accumulatedSize += math.min(endOffset.positionDiff(fetchOffset),
+
+                    fetchStatus.fetchInfo.fetchSize)
+            }
+          }
+        }
+      } catch {
+        case utpe: UnknownTopicOrPartitionException => // Case B
+          debug("Broker no longer know of %s, satisfy %s
+
+                   immediately".format(topicAndPartition, fetchMetadata))
+          return forceComplete()
+        case nle: NotLeaderForPartitionException =>  // Case A
+          debug("Broker is no longer the leader of %s, satisfy %s
+
+                 immediately".format(topicAndPartition, fetchMetadata))
+          return forceComplete()
+      }
+  }
+
+  // Case D
+  if (accumulatedSize >= fetchMetadata.fetchMinBytes)
+    forceComplete()
+  else
+    false
+}
+
+
+
+当达到延时的时间间隔或者对tryComplete执行完成时，执行的onComplete函数：
+
+这个函数重新执行上面分析的从LogManager组件中加载fetch请求的数据集的部分的操作，并通过回调函数向client端回写处理的结果。
+
+override def onComplete() {
+  val logReadResults = replicaManager.readFromLocalLog(
+
+fetchMetadata.fetchOnlyLeader,
+    fetchMetadata.fetchOnlyCommitted,
+    fetchMetadata.fetchPartitionStatus.mapValues(status => status.fetchInfo))
+
+  val fetchPartitionData = logReadResults.mapValues(result =>
+    FetchResponsePartitionData(result.errorCode, result.hw,
+
+      result.info.messageSet))
+
+  responseCallback(fetchPartitionData)
+}
+
+
+定时持久化HighWaterMarks线程
+
+当一个Broker上线时，执行ReplicaManager中的becomeLeaderOrFollower函数时，如果这个函数没有被初始化时，会启动一个定时器对副本中可以的offset的信息进行定时的持久化的操作。
+
+highWaterMarks中记录有所有在isr队列中的副本的最小可见的offset的信息。
+
+定时时间由replica.high.watermark.checkpoint.interval.ms配置，默认值5秒。
+
+
+
+定时执行的函数：
+
+// Flushes the highwatermark value for all partitions to the highwatermark file
+def checkpointHighWatermarks() {
+
+这里迭代所有的partition中副本在当前的broker中包含的所有的副本集合。
+  val replicas = allPartitions.values.map(_.getReplica(config.brokerId))
+
+          .collect{case Some(replica) => replica}
+
+
+
+根据当前broker中包含的副本集合，按副本存储的目录进行分组。
+  val replicasByDir = replicas.filter(_.log.isDefined).groupBy(
+
+           _.log.get.dir.getParentFile.getAbsolutePath)
+
+
+
+迭代按目录分组的所有的副本集合,并根据目录生成一个topicPartition->offset的map集合，把这个集合直接写入到dir中对应的replication-offset-checkpoint文件中。
+  for((dir, reps) <- replicasByDir) {
+    val hwms = reps.map(r => (new TopicAndPartition(r) ->
+
+          r.highWatermark.messageOffset)).toMap
+
+
+    try {
+      highWatermarkCheckpoints(dir).write(hwms)
+    } catch {
+      case e: IOException =>
+        fatal("Error writing to highwatermark file: ", e)
+        Runtime.getRuntime().halt(1)
+    }
+  }
+}
+
+
+副本复制
+
+当一个副本被标记为是一个follower的副本时，会生成一个副本复制的线程，用于同步这个副本对应的partition的leader的消息。
+
+
+
+这个线程在LeaderAndIsr请求发起时，通过调用ReplicaManager中的becomeLeaderOrFollower函数为入口发起,如果副本是follower的副本时，执行makeFollowers函数，最终根据每一个broker生成一个同步的ReplicaFetcherThread线程。
+
+
+
+这个线程的定时执行间隔通过replica.fetch.backoff.ms配置，默认值为1秒。
+
+
+
+线程执行的入口函数：
+
+在这个函数中，根据当前线程对应的broker中需要同步的partition的集合，生成fetch的请求，
+
+如果当前的线程中没有需要同步的partition时，会根据上面提到的配置的间隔时间进行wait操作。
+
+根据生成的请求执行processFetchRequest的操作。
+override def doWork() {
+  val fetchRequest = inLock(partitionMapLock) {
+    val fetchRequest = buildFetchRequest(partitionMap)
+    if (fetchRequest.isEmpty) {
+      trace("There are no active partitions. Back off for %d ms before sending a fetch
+
+            request".format(fetchBackOffMs))
+      partitionMapCond.await(fetchBackOffMs, TimeUnit.MILLISECONDS)
+    }
+    fetchRequest
+  }
+
+  if (!fetchRequest.isEmpty)
+    processFetchRequest(fetchRequest)
+}
+
+
+
+1,根据partition leader broker对应的partition的集合，生成fetch的请求：
+
+protected def buildFetchRequest(partitionMap: Map[TopicAndPartition, PartitionFetchState]): FetchRequest = {
+
+
+  val requestMap = mutable.Map.empty[TopicPartition, JFetchRequest.PartitionData]
+
+根据这个线程对应的broker的所有的partition生成fetch消息的请求信息，包含每个partition对应的offset开始值。
+  partitionMap.foreach { case ((TopicAndPartition(topic, partition),
+
+                   partitionFetchState)) =>
+    if (partitionFetchState.isActive)
+      requestMap(new TopicPartition(topic, partition)) =
+
+          new JFetchRequest.PartitionData(partitionFetchState.offset, fetchSize)
+  }
+
+  new FetchRequest(new JFetchRequest(replicaId, maxWait, minBytes,
+
+          requestMap.asJava))
+}
+
+
+
+2,执行fetch请求的处理：
+
+2,1发起fetch的请求，向对应的broker节点。
+
+2,2请求响应正确的消息处理：
+
+case Errors.NONE =>
+  try {
+
+得到fetch结果的消息集合，在验证完成消息集合后，得到这个消息集合中最后一条记录的offset的值，
+    val messages = partitionData.toByteBufferMessageSet
+    val validBytes = messages.validBytes
+    val newOffset = messages.shallowIterator.toSeq.lastOption match {
+      case Some(m: MessageAndOffset) => m.nextOffset
+      case None => currentPartitionFetchState.offset
+    }
+
+更新对应响应消息的partition对应的offset为fetch到的最后一条消息的offset.
+    partitionMap.put(topicAndPartition, new PartitionFetchState(newOffset))
+    fetcherLagStats.getFetcherLagStats(topic, partitionId).lag = Math.max(0L,
+
+                 partitionData.highWatermark - newOffset)
+    fetcherStats.byteRate.mark(validBytes)
+
+
+
+执行processPartitionData函数来处理fetch响应过来的消息集合。
+    processPartitionData(topicAndPartition, currentPartitionFetchState.offset,
+
+           partitionData)
+  } catch {
+    case ime: InvalidMessageException =>
+      logger.error("Found invalid messages during fetch for partition [" + topic +
+
+           "," + partitionId + "] offset " + currentPartitionFetchState.offset  +
+
+           " error " + ime.getMessage)
+    case e: Throwable =>
+      throw new KafkaException("error processing data for partition [%s,%d]
+
+        offset %d"
+        .format(topic, partitionId, currentPartitionFetchState.offset), e)
+  }
+
+
+
+用于处理某个partition的fetch响应的消息集合：
+
+// process fetched data
+def processPartitionData(topicAndPartition: TopicAndPartition, fetchOffset: Long,
+
+partitionData: PartitionData) {
+  try {
+    val TopicAndPartition(topic, partitionId) = topicAndPartition
+    val replica = replicaMgr.getReplica(topic, partitionId).get
+    val messageSet = partitionData.toByteBufferMessageSet
+    warnIfMessageOversized(messageSet)
+
+这里首先检查fetch请求前的offset(发起请求时offset的开始值)与当前的副本中最后一条消息的offset的值是否相同，这个值必须相同。
+    if (fetchOffset != replica.logEndOffset.messageOffset)
+      throw new RuntimeException("Offset mismatch: fetched offset = %d, log end offset
+
+        = %d.".format(fetchOffset, replica.logEndOffset.messageOffset))
+
+
+    trace("Follower %d has replica log end offset %d for partition %s. Received %d
+
+           messages and leader hw %d"
+          .format(replica.brokerId, replica.logEndOffset.messageOffset,
+
+             topicAndPartition, messageSet.sizeInBytes,
+
+             partitionData.highWatermark))
+
+
+
+通过副本对应的Log实例，向Log中写入这个消息集合，在写入这个消息集合时，设置assignOffsets的值为false,因为这个消息集合已经存在对应的offset,不需要对offset进行分配。
+    replica.log.get.append(messageSet, assignOffsets = false)
+
+
+    trace("Follower %d has replica log end offset %d after appending %d bytes of
+
+           messages for partition %s"
+          .format(replica.brokerId, replica.logEndOffset.messageOffset,
+
+             messageSet.sizeInBytes, topicAndPartition))
+
+
+
+得到响应的消息中响应过来的leader的副本中记录的highWatermark的offset与当前的副本中最后的offset的值，取最小的offset为当前副本的highWatermark的值。
+    val followerHighWatermark = replica.logEndOffset.messageOffset.min(
+
+            partitionData.highWatermark)
+    // for the follower replica, we do not need to keep
+    // its segment base offset the physical position,
+    // these values will be computed upon making the leader
+    replica.highWatermark = new LogOffsetMetadata(followerHighWatermark)
+    trace("Follower %d set replica high watermark for partition [%s,%d] to %s"
+          .format(replica.brokerId, topic, partitionId, followerHighWatermark))
+  } catch {
+    case e: KafkaStorageException =>
+      fatal("Disk error while replicating data.", e)
+      Runtime.getRuntime.halt(1)
+  }
+}
+
+
+
+2,3处理响应的partition中出现的OFFSET_OUT_OF_RANGE错误代码：
+
+case Errors.OFFSET_OUT_OF_RANGE =>
+  try {
+
+这里根据handleOffsetOutOfRange函数得到这个partition处理的最新的offset,并更新到下次进行fetch操作的offset中。
+    val newOffset = handleOffsetOutOfRange(topicAndPartition)
+    partitionMap.put(topicAndPartition, new PartitionFetchState(newOffset))
+    error("Current offset %d for partition [%s,%d] out of range; reset offset to %d"
+      .format(currentPartitionFetchState.offset, topic, partitionId, newOffset))
+  } catch {
+    case e: Throwable =>
+      error("Error getting offset for partition [%s,%d] to broker %d"
+
+            .format(topic, partitionId, sourceBroker.id), e)
+      partitionsWithError += topicAndPartition
+  }
+
+
+
+offset超出范围的partition的响应的处理：
+
+ */
+def handleOffsetOutOfRange(topicAndPartition: TopicAndPartition): Long = {
+
+得到当前的partition在当前的节点上的副本。
+  val replica = replicaMgr.getReplica(topicAndPartition.topic,
+
+          topicAndPartition.partition).get
+
+这里直接向leader的副本发起一个ListOffsetRequest请求，并得到这个partition中最大的一个offset的值。
+  val leaderEndOffset: Long = earliestOrLatestOffset(topicAndPartition,
+
+ListOffsetRequest.LATEST_TIMESTAMP,
+    brokerConfig.brokerId)
+
+如果当前leader中的副本的最大的offset小于当前副本中最大的offset,表示当前的副本中的数据比leader中的数据数据多，
+  if (leaderEndOffset < replica.logEndOffset.messageOffset) {
+
+检查unclean.leader.election.enable配置是否配置为true,这种情况，这个配置必须为true.
+    if (!LogConfig.fromProps(brokerConfig.originals,
+
+        AdminUtils.fetchEntityConfig(replicaMgr.zkUtils,
+      ConfigType.Topic, topicAndPartition.topic)).uncleanLeaderElectionEnable) {
+
+
+      fatal("Halting because log truncation is not allowed for topic %s,"
+
+        .format(topicAndPartition.topic) +
+        " Current leader %d's latest offset %d is less than replica %d's latest offset
+
+        %d".format(sourceBroker.id, leaderEndOffset, brokerConfig.brokerId,
+
+             replica.logEndOffset.messageOffset))
+      Runtime.getRuntime.halt(1)
+    }
+
+    warn("Replica %d for partition %s reset its fetch offset from %d to current leader
+
+         %d's latest offset %d"
+      .format(brokerConfig.brokerId, topicAndPartition,
+
+          replica.logEndOffset.messageOffset, sourceBroker.id, leaderEndOffset))
+
+
+
+对当前副本中的日志文件进行截断，截断到leader的endOffset对应的位置，同时根据这个offset更新对应的RecoveryPointOffsets的值。
+
+这个过程会更新对应目录下recovery-point-offset-checkpoint文件的内容。
+    replicaMgr.logManager.truncateTo(Map(topicAndPartition -> leaderEndOffset))
+
+返回新的offset的值为leader的副本中最后个endoffset的值。
+    leaderEndOffset
+  }
+
+这种情况下，表示leader的副本中最大的offset的值比当前的副本中最大的offset的值大，也就是说当前的副本中最大的offset其实是小于leader的副本中最小的offset.
+
+  else {
+
+发起一个ListOffsetRequest请求。这个请求得到当前leader的副本中最小的offset的值。
+    val leaderStartOffset: Long = earliestOrLatestOffset(topicAndPartition,
+
+          ListOffsetRequest.EARLIEST_TIMESTAMP,
+          brokerConfig.brokerId)
+
+
+    warn("Replica %d for partition %s reset its fetch offset from %d to current leader
+
+        %d's start offset %d"
+      .format(brokerConfig.brokerId, topicAndPartition,
+
+        replica.logEndOffset.messageOffset, sourceBroker.id, leaderStartOffset))
+
+
+
+
+
+这里根据得到的leader的副本中最小的offset与当前的副本中最大的offset取最大值，这个值是下次执行fetch时使用的startOffset的值。
+    val offsetToFetch = Math.max(leaderStartOffset,
+
+          replica.logEndOffset.messageOffset)
+
+
+
+如果leader的副本中对应的最小的offset的值大于了当前副本中最大的offset的值。
+
+这里会删除当前副本中Log下所有的segment的日志与索引文件，并根据这个leaderStartOffset的offset的值，生成一个新的segment的实例，更新这个partition的RecoveryPointOffsets的值。
+
+这个过程会更新对应目录下recovery-point-offset-checkpoint文件的内容。
+    if (leaderStartOffset > replica.logEndOffset.messageOffset)
+      replicaMgr.logManager.truncateFullyAndStartAt(topicAndPartition,
+
+           leaderStartOffset)
+    offsetToFetch
+  }
+}
