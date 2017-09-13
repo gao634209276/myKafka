@@ -1,0 +1,14 @@
+内存溢出错误参考error.log:
+-server -XX:+UseG1GC -XX:ParallelGCThreads=8
+-XX:ConcGCThreads=8  -XX:MaxGCPauseMillis=200
+-XX:InitiatingHeapOccupancyPercent=35
+-XX:+DisableExplicitGC -Djava.awt.headless=true
+-XX:MaxDirectMemorySize=5g
+
+
+-Xmx1G -Xms1G -XX:PermSize=100M -XX:+UseG1GC
+-XX:ParallelGCThreads=8 -XX:ConcGCThreads=8 -XX:MaxGCPauseMillis=200
+-XX:InitiatingHeapOccupancyPercent=35 -XX:+DisableExplicitGC
+-Djava.awt.headless=true -XX:MaxDirectMemorySize=5g
+-Xloggc:/app/sinova/kafka_2.11-0.10.2.1/bin/../logs/kafkaServer-gc.log
+-verbose:gc -XX:+PrintGCDetails -XX:+PrintGCDateStamps -XX:+PrintGCTimeStamps
