@@ -1,0 +1,30 @@
+crontab -l
+find /disk10/logs/mobileService -type f -name '*log*gz' -mtime +150
+find /disk10/logs/mobileService -type f -name '*log*gz' -mtime +150 -exec rm {} \;
+sudo find /proc -print | grep -P '/proc/\d+/fd/'| awk -F '/' '{print $3}' | uniq -c | sort -rn | head
+ps ax | grep -i 'kafka\.Kafka' | grep java | grep -v grep | awk '{print $1}'
+echo stat|nc localhost 2181
+jstat -gc 12790 1s 100
+jmap -heap 22394
+jstack 28940 >28940.log
+jstat  -gccause    27593 1s 100
+jmap -histo 31355 |more
+jmap -F  -histo 15463 |more
+tail -500000  kafkaServer-gc.log |grep 'Heap' |more
+jmap -histo:live -F 11640 | head -7
+jmap -dump:live,format=b,file=heap.bin 642
+ps -ef|grep kafka
+ vim bin/kafka-run-class.sh
+cat   kafkaServer-gc.log| grep "GC pause"|grep yong
+cat   kafkaServer-gc.log| grep "pause"|grep yong
+cat   kafkaServer-gc.log|grep yong |more
+cat   kafkaServer-gc.log|grep young |more
+cat   kafkaServer-gc.log|grep young |grep pause
+jmap -dump:live,format=b,file=heap.bin 18024
+mv heap.bin  heap1g.bin
+grep full kafkaServer-gc.log
+grep fgc kafkaServer-gc.log
+ grep old kafkaServer-gc.log
+grep -i old kafkaServer-gc.log
+grep -i FULL  kafkaServer-gc.log
+dmesg|grep kill

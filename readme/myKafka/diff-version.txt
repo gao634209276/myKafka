@@ -1,0 +1,14 @@
+0.8
+老kafka命令方式:
+bin/kafka-console-consumer.sh  --topic smsbusTopic --zookeeper 10.70.48.12:2181,10.70.48.14:2181,10.70.48.15:2181,10.70.48.16:2181,10.70.48.13:2181/kafkazkpath
+bin/kafka-run-class.sh kafka.tools.ConsumerOffsetChecker --group smsbusTopicId --topic smsbusTopic  --zookeeper 10.70.48.12:2181,10.70.48.14:2181,10.70.48.15:2181,10.70.48.16:2181,10.70.48.13:2181/kafkazkpath
+bin/kafka-topics.sh  --zookeeper 10.70.48.12:2181,10.70.48.14:2181/kafkazkpath -describe -topic smsbusTopic
+新0.10 kafka:
+Using the ConsoleConsumer with old consumer is deprecated and will be removed in a future major release. Consider using the new consumer by passing [bootstrap-server] instead of [zookeeper].
+bin/kafka-console-consumer.sh --topic smsbusTopic --bootstrap-server 132.46.115.96:9092,132.46.115.97:9092,132.46.115.98:9092
+bin/kafka-consumer-groups.sh --bootstrap-server 132.46.115.96:9092,132.46.115.97:9092,132.46.115.98:9092 --group smsbuszhfw --describe
+修复数据:
+删除zk
+	./zkCli.sh
+	ls /kafka/consumers
+	rmr /kafka/consumers/smsbuszhfw
